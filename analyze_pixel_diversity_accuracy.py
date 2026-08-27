@@ -1,0 +1,307 @@
+"""
+Experiment: does reduced pixel-value diversity ("flatness") in non-growing-
+season Sentinel-2 imagery coincide with worse wealth-prediction accuracy?
+
+Theory being tested: outside the growing season, the vegetation-phenology
+signal the model leans on is largely absent, so chips look spectrally flatter
+(less pixel-to-pixel variation) -- and the flatter the chip, the less signal
+the model has to work with, so error should go up. That effect is expected to
+be strongest in rural/agricultural tracts, where vegetation IS the texture;
+urban tracts (built structures, roads, mixed materials) should keep a richer
+signal year-round regardless of season.
+
+That's three separable, testable sub-claims, run in order below:
+
+  H1a  Pixel diversity is itself seasonal: lower in non-growing-season
+       quarters (Q4/Q1) than growing-season quarters (Q2/Q3).
+  H1b  Pixel diversity predicts per-chip accuracy directly: flatter chips
+       have higher error, INCLUDING within a single quarter (i.e. this
+       isn't only "winter chips are worse" restated -- a flat chip should
+       cost you accuracy even relative to other chips shot the same
+       quarter, e.g. a cloudy/hazy summer chip).
+  H1c  The diversity-accuracy relationship (and the seasonal dip in
+       diversity) is bigger in agricultural/rural tracts than urban ones.
+       Only runs if GEOID_FROM_NAME is filled in and LC_CSV is provided.
+
+Inputs
+------
+QUARTERS: list of dicts, one per quarter already validated in
+    validation.ipynb: {"year", "quarter", "preds_csv", "diversity_csv"}.
+    preds_csv is the existing per-quarter model output (columns include
+    "name", "pred", "label"). diversity_csv is the output of
+    compute_pixel_diversity.py run against that same quarter's raw chip
+    directory. The two are joined on chip FILENAME (not full path), since
+    they may have been produced from different machines/mounts.
+
+GEOID_FROM_NAME / LC_CSV: optional, only needed for H1c. LC_CSV uses the
+    same format as analyze_seasonality_lag.py's lc.csv (GEOID index, named
+    land-cover fraction columns).
+
+Outputs (under OUT_DIR):
+    panel.csv                      merged chip-quarter panel
+    diversity_by_quarter.csv/.png  H1a
+    diversity_error_scatter.png    H1b
+    h1_summary.txt                 all printed stats, captured to a file
+"""
+
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+import statsmodels.formula.api as smf
+
+
+# -------------------------------------------------------------------------
+# Config -- <<< fill these in
+# -------------------------------------------------------------------------
+QUARTERS = [
+    # {"year": 2016, "quarter": 2,
+    #  "preds_csv": "/data/hbaier/new_data/tlag/imagery/q2_2016_s2/artifacts/q2_2016_v1/epoch178_preds.csv",
+    #  "diversity_csv": "./diversity/q2_2016.csv"},
+    # ... one entry per quarter (q2_2016 .. q4_2019 for OH, per validation.ipynb)
+]
+
+OUT_DIR = Path("./out_pixel_diversity")  # <<< change me
+
+# Ohio (corn belt) growing season ~ April-September. Revisit per state when
+# this analysis is extended to AZ/CA/GA/PA -- desert/irrigated/multi-crop
+# regions won't share this quarter split.
+GROWING_QUARTERS = {2, 3}
+NON_GROWING_QUARTERS = {1, 4}
+
+# Preferred diversity metric, in priority order: use the first one present
+# in the merged panel. ndvi_std is the more direct test of "vegetation
+# signal" if compute_pixel_diversity.py had a NIR band configured; falls
+# back to raw RGB spread otherwise.
+DIVERSITY_METRIC_PRIORITY = ["ndvi_std", "mean_band_std"]
+
+# Optional, for H1c only.
+GEOID_FROM_NAME = None   # e.g. lambda name: re.search(r"(\d{11})", name).group(1)
+LC_CSV = None             # e.g. "./lc.csv"
+
+
+# -------------------------------------------------------------------------
+# Step 1 -- load + join preds with diversity metrics, on chip filename
+# -------------------------------------------------------------------------
+def load_quarter(year, quarter, preds_csv, diversity_csv):
+    preds = pd.read_csv(preds_csv)
+    div = pd.read_csv(diversity_csv)
+
+    preds["chip_file"] = preds["name"].apply(lambda p: Path(p).name)
+    div["chip_file"] = div["name"].apply(lambda p: Path(p).name)
+    div = div.drop(columns=["name"])
+
+    merged = preds.merge(div, on="chip_file", how="inner", validate="one_to_one")
+    n_dropped = len(preds) - len(merged)
+    if n_dropped:
+        print(f"  q{quarter}_{year}: {n_dropped}/{len(preds)} chips had no "
+              f"diversity match (filename join) -- check compute_pixel_diversity.py "
+              f"was run on the matching chip directory.")
+
+    merged["year"] = year
+    merged["quarter"] = quarter
+    merged["error"] = merged["pred"] - merged["label"]
+    merged["abs_error"] = merged["error"].abs()
+    merged["sq_error"] = merged["error"] ** 2
+    return merged
+
+
+def build_panel(quarters_cfg):
+    parts = []
+    for cfg in quarters_cfg:
+        print(f"Loading q{cfg['quarter']}_{cfg['year']}...")
+        parts.append(load_quarter(cfg["year"], cfg["quarter"],
+                                   cfg["preds_csv"], cfg["diversity_csv"]))
+    panel = pd.concat(parts, ignore_index=True)
+
+    panel["season"] = np.where(panel["quarter"].isin(GROWING_QUARTERS),
+                                "growing", "non_growing")
+    panel["t"] = (panel["year"] - panel["year"].min()) * 4 + (panel["quarter"] - 1)
+    panel["t"] = panel["t"] - panel["t"].min()
+
+    if GEOID_FROM_NAME is not None:
+        panel["GEOID"] = panel["name"].apply(GEOID_FROM_NAME)
+
+    return panel
+
+
+def pick_metric(panel):
+    for m in DIVERSITY_METRIC_PRIORITY:
+        if m in panel.columns and panel[m].notna().any():
+            return m
+    raise ValueError(f"None of {DIVERSITY_METRIC_PRIORITY} found in panel columns")
+
+
+# -------------------------------------------------------------------------
+# H1a -- is pixel diversity itself seasonal?
+# -------------------------------------------------------------------------
+def h1a_seasonal_diversity(panel, metric, out_dir):
+    print("\n" + "=" * 70)
+    print(f"H1a -- seasonality of pixel diversity ({metric})")
+    print("=" * 70)
+
+    by_q = (panel.groupby(["year", "quarter"])[metric]
+                 .agg(["mean", "std", "count"])
+                 .reset_index()
+                 .sort_values(["year", "quarter"]))
+    by_q["t"] = (by_q["year"] - by_q["year"].min()) * 4 + (by_q["quarter"] - 1)
+    by_q["t"] = by_q["t"] - by_q["t"].min()
+    by_q.to_csv(out_dir / "diversity_by_quarter.csv", index=False)
+    print(by_q.to_string(index=False))
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(by_q["t"], by_q["mean"], "-o", color="tab:blue")
+    ax.fill_between(by_q["t"], by_q["mean"] - by_q["std"], by_q["mean"] + by_q["std"],
+                     alpha=0.15, color="tab:blue")
+    for _, r in by_q.iterrows():
+        color = "tab:green" if r["quarter"] in GROWING_QUARTERS else "tab:orange"
+        ax.axvspan(r["t"] - 0.5, r["t"] + 0.5, color=color, alpha=0.06)
+    ax.set_xticks(by_q["t"])
+    ax.set_xticklabels([f"q{q}_{y}" for y, q in zip(by_q["year"], by_q["quarter"])],
+                        rotation=45, ha="right")
+    ax.set_ylabel(metric)
+    ax.set_title(f"Per-quarter pixel diversity ({metric})\n"
+                 "green=growing season, orange=non-growing")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / "diversity_by_quarter.png", dpi=150)
+    plt.close()
+
+    growing = panel.loc[panel["season"] == "growing", metric].dropna()
+    non_growing = panel.loc[panel["season"] == "non_growing", metric].dropna()
+    t, p = stats.ttest_ind(growing, non_growing, equal_var=False, alternative="greater")
+    u, p_u = stats.mannwhitneyu(growing, non_growing, alternative="greater")
+    print(f"\nGrowing-season {metric}: mean={growing.mean():.4f}, n={len(growing)}")
+    print(f"Non-growing {metric}:    mean={non_growing.mean():.4f}, n={len(non_growing)}")
+    print(f"Welch t-test (growing > non-growing):  t={t:.3f}, p={p:.4f}")
+    print(f"Mann-Whitney U (growing > non-growing): U={u:.1f}, p={p_u:.4f}")
+
+    return by_q
+
+
+# -------------------------------------------------------------------------
+# H1b -- does pixel diversity predict accuracy, including within-quarter?
+# -------------------------------------------------------------------------
+def h1b_diversity_predicts_error(panel, metric, out_dir):
+    print("\n" + "=" * 70)
+    print(f"H1b -- does {metric} predict accuracy?")
+    print("=" * 70)
+
+    d = panel.dropna(subset=[metric, "sq_error", "abs_error"])
+
+    r_pearson, p_pearson = stats.pearsonr(d[metric], d["abs_error"])
+    r_spearman, p_spearman = stats.spearmanr(d[metric], d["abs_error"])
+    print(f"Overall correlation, {metric} vs abs_error:")
+    print(f"  Pearson  r={r_pearson:+.4f}, p={p_pearson:.4g}")
+    print(f"  Spearman r={r_spearman:+.4f}, p={p_spearman:.4g}")
+    print("(negative r = flatter chips -> bigger errors, as the theory predicts)")
+
+    # Within-quarter correlation: demean both variables by quarter first, so
+    # this isolates whether diversity matters even holding season fixed --
+    # distinct from H1a's "winter chips are just worse".
+    d = d.copy()
+    d["metric_c"] = d[metric] - d.groupby(["year", "quarter"])[metric].transform("mean")
+    d["abs_error_c"] = d["abs_error"] - d.groupby(["year", "quarter"])["abs_error"].transform("mean")
+    r_within, p_within = stats.pearsonr(d["metric_c"], d["abs_error_c"])
+    print(f"\nWithin-quarter (season-demeaned) correlation:")
+    print(f"  Pearson r={r_within:+.4f}, p={p_within:.4g}")
+
+    print(f"\nOLS: sq_error ~ {metric} + C(quarter), cluster-robust by quarter")
+    m = smf.ols(f"sq_error ~ {metric} + C(quarter)", data=d).fit(
+        cov_type="cluster", cov_kwds={"groups": d["quarter"].astype(str) + "_" + d["year"].astype(str)}
+    )
+    print(m.summary())
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sample = d.sample(min(5000, len(d)), random_state=0)
+    ax.scatter(sample[metric], sample["abs_error"], s=6, alpha=0.25, color="tab:blue")
+    ax.set_xlabel(metric)
+    ax.set_ylabel("|prediction error|")
+    ax.set_title(f"Pixel diversity vs. accuracy\nPearson r={r_pearson:+.3f} (p={p_pearson:.3g})")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / "diversity_error_scatter.png", dpi=150)
+    plt.close()
+
+    return m
+
+
+# -------------------------------------------------------------------------
+# H1c -- is the effect stronger in rural/agricultural tracts?
+# -------------------------------------------------------------------------
+def h1c_landscape_moderation(panel, metric, lc_csv, out_dir):
+    print("\n" + "=" * 70)
+    print("H1c -- landscape moderation (agricultural vs urban)")
+    print("=" * 70)
+
+    if "GEOID" not in panel.columns:
+        print("Skipped: GEOID_FROM_NAME not configured, can't join land cover.")
+        return None
+
+    lc = pd.read_csv(lc_csv, dtype={0: str}, index_col=0)
+    lc.index.name = "GEOID"
+    lc = lc.reset_index()
+    lc_class_cols = [c for c in lc.columns if c != "GEOID"]
+    row_sums = lc[lc_class_cols].sum(axis=1)
+    if (row_sums > 2).any():
+        lc[lc_class_cols] = lc[lc_class_cols].div(row_sums, axis=0)
+
+    d = panel.merge(lc, on="GEOID", how="inner")
+    d = d.dropna(subset=[metric, "sq_error", "Cropland"]).copy()
+    d["cropland_c"] = d["Cropland"] - d["Cropland"].mean()
+    print(f"Joined {len(d):,} / {len(panel):,} chip-quarter rows to land cover.")
+
+    print(f"\nMixed model: sq_error ~ {metric} * cropland_c + (1|GEOID)")
+    try:
+        m1 = smf.mixedlm(f"sq_error ~ {metric} * cropland_c", data=d, groups=d["GEOID"]).fit(method="lbfgs")
+    except np.linalg.LinAlgError:
+        m1 = smf.ols(f"sq_error ~ {metric} * cropland_c", data=d).fit(
+            cov_type="cluster", cov_kwds={"groups": d["GEOID"]})
+    print(m1.summary())
+    print(f"\nInteraction term ({metric}:cropland_c) tests whether the "
+          f"diversity->error relationship is steeper in more agricultural tracts.")
+
+    print(f"\nMixed model: {metric} ~ C(season) * cropland_c + (1|GEOID)")
+    try:
+        m2 = smf.mixedlm(f"{metric} ~ C(season) * cropland_c", data=d, groups=d["GEOID"]).fit(method="lbfgs")
+    except np.linalg.LinAlgError:
+        m2 = smf.ols(f"{metric} ~ C(season) * cropland_c", data=d).fit(
+            cov_type="cluster", cov_kwds={"groups": d["GEOID"]})
+    print(m2.summary())
+    print(f"\nInteraction term (season:cropland_c) tests whether the seasonal "
+          f"dip in diversity is bigger in more agricultural tracts.")
+
+    return m1, m2
+
+
+# -------------------------------------------------------------------------
+# main
+# -------------------------------------------------------------------------
+def main():
+    if not QUARTERS:
+        raise SystemExit(
+            "QUARTERS is empty -- fill in {year, quarter, preds_csv, diversity_csv} "
+            "entries at the top of this script before running."
+        )
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    panel = build_panel(QUARTERS)
+    panel.to_csv(OUT_DIR / "panel.csv", index=False)
+    print(f"\nPanel: {len(panel):,} chip-quarter rows across "
+          f"{panel[['year', 'quarter']].drop_duplicates().shape[0]} quarters")
+
+    metric = pick_metric(panel)
+    print(f"Using diversity metric: {metric}")
+
+    h1a_seasonal_diversity(panel, metric, OUT_DIR)
+    h1b_diversity_predicts_error(panel, metric, OUT_DIR)
+    h1c_landscape_moderation(panel, metric, LC_CSV, OUT_DIR) if LC_CSV else \
+        print("\nH1c skipped: LC_CSV not set.")
+
+
+if __name__ == "__main__":
+    main()
