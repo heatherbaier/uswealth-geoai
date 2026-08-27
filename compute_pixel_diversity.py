@@ -1,16 +1,27 @@
 """
 Compute per-chip pixel-value diversity ("flatness") metrics from raw
-Sentinel-2 (or Landsat) GeoTIFF chips.
+Sentinel-2 (or Landsat) GeoTIFF chips produced by the geoetl MPC pipeline
+(geoetl/io/mpc.py + geoetl/io/base.py).
 
-Why this has to run on the raw .tif, not the training PNGs: convert_tifs_to_pngs.py
-stretches each chip independently to its own 2nd-98th percentile before mapping
-to uint8. That per-image normalization would make a spectrally flat winter chip
-and a spectrally rich summer chip both use the full 0-255 range -- exactly the
-signal this analysis needs to preserve. Point --chip-dir at the original uint16
-GeoTIFFs used to produce the PNGs, not the PNGs themselves.
+Why this runs on the .tif chips: geoetl writes chips as uint16 "reflectance
+x 10000" (clipped to [0, 65535], nodata=0), with a fixed scale factor per
+sensor -- NOT a per-image stretch. So pixel values are already directly
+comparable across chips/quarters, and this script's percentile-range
+metrics measure genuine cross-chip differences in spectral spread rather
+than a preprocessing artifact. (If a chip was instead exported as
+output.format=png, that's also safe to use here -- geoetl's write_chip()
+uses one fixed divisor for the whole dataset, not a per-image stretch --
+but .tif is geoetl's default and what these tlag configs currently use.)
+
+Chip filenames are the tract GEOID directly: pipeline.py writes each chip
+to  <output.root>/chips/{GEOID}.{tif,png}  (aoi_id = row[uid_column], and
+every tlag config sets uid_column: GEOID). So Path(chip).stem == GEOID --
+no separate join/extraction step needed; this script emits a GEOID column
+directly from the filename.
 
 Output is one row per chip with:
     name                          full path to the chip (join key downstream)
+    GEOID                         tract GEOID (= filename stem)
     mean_band_std                 mean, across bands, of the per-band std dev
     mean_band_range               mean, across bands, of the (p2, p98) range
     band{i}_std / band{i}_range_2_98   per-band detail
@@ -19,9 +30,9 @@ Output is one row per chip with:
 
 Usage:
     python compute_pixel_diversity.py \
-        --chip-dir /data/hbaier/new_data/tlag/imagery/q1_2017_s2/chips \
+        --chip-dir /data/hbaier/new_data/tlag/az_imagery/q1_2016_s2/chips \
         --sensor sentinel2 \
-        --out ./diversity/q1_2017.csv
+        --out ./diversity/az_q1_2016.csv
 """
 
 import argparse
@@ -33,15 +44,20 @@ import rasterio
 from tqdm.auto import tqdm
 
 
-# Band name -> index within each chip's band stack.
-# sentinel2 here only maps RGB, same as convert_tifs_to_pngs.py's BAND_ORDER.
-# <<< If your Sentinel-2 chips also carry B08 (NIR), add "nir": <index> below
-# so NDVI diversity gets computed -- that's the more direct test of the
-# "vegetation signal" theory than raw RGB spread.
+# Band name -> index within each chip's band stack. Mirrors
+# geoetl/io/mpc.py's SENSOR_CONFIGS[...]["bands"] exactly -- keep these two
+# in sync if that config changes.
+#
+# sentinel2 currently ships RGB only (SENSOR_CONFIGS["sentinel2"]["bands"] =
+# ["B04", "B03", "B02"]), so NDVI diversity is NOT computed for these chips
+# today. <<< If you add "B08" (NIR) to that list before this week's
+# redownload, add "nir": 3 below (it'll be appended after B04/B03/B02) to
+# get NDVI diversity -- the more direct test of the vegetation-signal
+# theory than raw RGB spread.
 SENSOR_BANDS = {
-    "sentinel2": {"red": 0, "green": 1, "blue": 2},
+    "sentinel2": {"red": 0, "green": 1, "blue": 2},   # <<< add "nir": 3 if B08 is added to mpc.py
     "landsat8":  {"swir22": 0, "swir16": 1, "nir": 2, "red": 3, "green": 4, "blue": 5},
-    "landsat5":  {"nir": 2, "red": 3, "green": 4, "blue": 5},  # <<< verify vs mpc.py
+    "landsat5":  {"swir22": 0, "nir": 1, "red": 2, "green": 3, "blue": 4},  # coastal (index 5) unused
 }
 
 LOW_PCT, HIGH_PCT = 2, 98  # match the stretch percentiles used for the PNGs
@@ -54,7 +70,7 @@ def chip_diversity(path, band_map):
     band_stds, band_ranges, per_band = [], [], {}
     for b in range(data.shape[0]):
         band = data[b]
-        valid = band[band > 0]  # 0 = nodata, same convention as convert_tifs_to_pngs.py
+        valid = band[band > 0]  # 0 = nodata, matches geoetl's fillna(0) convention
         if valid.size < 10:
             continue
         std = float(np.std(valid))
@@ -70,6 +86,7 @@ def chip_diversity(path, band_map):
 
     out = {
         "name": str(path),
+        "GEOID": Path(path).stem,
         "mean_band_std": float(np.mean(band_stds)),
         "mean_band_range": float(np.mean(band_ranges)),
         **per_band,
