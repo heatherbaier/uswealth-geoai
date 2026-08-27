@@ -4,3 +4,4 @@ out
 wc
 *csv
 *.ipynb_checkpoints*
+__pycache__/
