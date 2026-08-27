@@ -1,0 +1,6 @@
+archive
+data
+out
+wc
+*csv
+*.ipynb_checkpoints*
