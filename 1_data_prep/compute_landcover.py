@@ -16,6 +16,16 @@ Generalizes what used to be OH-only lc.py / compute_landcover_oh.py:
     columns (Cropland, Built-up, ...) the analysis scripts expect, instead
     of leaving that as a manual follow-up step (this was the "no script
     does the JSON -> lc.csv conversion" gap noted in REPLICATION.md).
+  - Reads each WorldCover tile in bounded pixel blocks (BLOCK_PX) rather
+    than one array covering a tract's whole bounding box. Statewide tract
+    shapefiles mix small urban tracts with rare, enormous rural ones (AZ's
+    Coconino County tracts are the canonical example -- geoetl hit and
+    documented the identical problem in geoetl/io/mpc.py), and even a
+    "windowed"/from_disk read materializes the whole bounding box for
+    those outliers, which OOM-kills the process. Peak memory here is
+    bounded per-block regardless of tract size; a hard MAX_TRACT_PIXELS
+    cap (skipped + logged to skipped_oversized_tracts_<state>.txt) is a
+    belt-and-suspenders safety valve for a truly degenerate geometry.
 
 Usage:
     python compute_landcover.py --state oh
@@ -35,11 +45,31 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
-import rioxarray as rxr
+import rasterio
 import requests
+from rasterio.features import geometry_mask
+from rasterio.windows import Window
 from tqdm.auto import tqdm
 
 S3_URL_PREFIX = "https://esa-worldcover.s3.eu-central-1.amazonaws.com"
+
+# Read each tile in bounded pixel blocks instead of one array covering the
+# tract's whole bounding box. Mirrors geoetl's chunk_px fix in
+# geoetl/io/mpc.py::_build_composite for the identical problem: a
+# statewide tract shapefile mixes small urban tracts with rare, enormous
+# rural ones (geoetl's own comment there names a Coconino County, AZ tract
+# as ~100x wider than a Phoenix one), so an AOI-sized bounding-box read
+# that's fine for 99% of tracts can OOM on the outliers regardless of
+# "windowed"/from_disk reads, because the window itself is still huge for
+# those tracts. Block reads bound peak memory per tract to one block.
+BLOCK_PX = 2048
+
+# Hard safety cap, mirroring geoetl's AOITooLargeError / max_composite_mb:
+# even block-by-block, a truly degenerate geometry (e.g. a bad multipolygon
+# spanning the whole state) shouldn't be allowed to grind forever. ~800M
+# uint8 pixels is a ~280km x 280km AOI at 10m resolution -- far bigger than
+# any real census tract, so this should never actually trigger on good data.
+MAX_TRACT_PIXELS = 800_000_000
 
 # ESA WorldCover 10m class legend (https://esa-worldcover.org/en/data-access
 # -- "Product validation and specification" documents the class codes).
@@ -89,24 +119,54 @@ def download_tiles(tiles, year, output_folder: Path):
     return paths
 
 
-def tract_class_counts(tract_geom, tile_gdf, tile_paths_by_ll):
+def _iter_blocks(window: Window, block_px: int):
+    """Tile a rasterio Window into block_px x block_px sub-windows (absolute
+    pixel offsets into the source raster), last row/col clipped to fit."""
+    row0, col0 = int(window.row_off), int(window.col_off)
+    height, width = int(window.height), int(window.width)
+    for r in range(0, height, block_px):
+        for c in range(0, width, block_px):
+            h = min(block_px, height - r)
+            w = min(block_px, width - c)
+            yield Window(col0 + c, row0 + r, w, h)
+
+
+def tract_class_counts(tract_geom, tile_gdf, tile_paths_by_ll, on_skip=None):
     """Sum per-class pixel counts for one tract across every WorldCover
-    tile it intersects (a tract can straddle a tile boundary)."""
+    tile it intersects (a tract can straddle a tile boundary), reading each
+    tile in bounded BLOCK_PX x BLOCK_PX blocks so peak memory doesn't scale
+    with tract size (see BLOCK_PX comment above)."""
     hits = tile_gdf[tile_gdf.intersects(tract_geom)]
     total = Counter()
     for ll_tile in hits.ll_tile:
         path = tile_paths_by_ll.get(ll_tile)
         if path is None:
             continue
-        with rxr.open_rasterio(path, masked=True, chunks=True) as src:
+        with rasterio.open(path) as src:
             try:
-                clipped = src.rio.clip([tract_geom], from_disk=True)
+                window = rasterio.windows.from_bounds(*tract_geom.bounds, transform=src.transform)
             except Exception:
                 continue
-            unique, counts = np.unique(clipped, return_counts=True, equal_nan=True)
-            for u, c in zip(unique, counts):
-                if not np.isnan(u):
-                    total[int(u)] += int(c)
+            window = window.intersection(Window(0, 0, src.width, src.height))
+            if window.width <= 0 or window.height <= 0:
+                continue
+            n_px = window.width * window.height
+            if n_px > MAX_TRACT_PIXELS:
+                if on_skip:
+                    on_skip(f"tile window ~{window.width:.0f}x{window.height:.0f} px "
+                            f"(~{n_px / 1e6:.0f}M) exceeds MAX_TRACT_PIXELS")
+                continue
+
+            for block in _iter_blocks(window, BLOCK_PX):
+                data = src.read(1, window=block)
+                block_transform = src.window_transform(block)
+                inside = geometry_mask([tract_geom], out_shape=data.shape,
+                                        transform=block_transform, invert=True)
+                vals = data[inside]
+                if vals.size:
+                    u, c = np.unique(vals, return_counts=True)
+                    for uu, cc in zip(u, c):
+                        total[int(uu)] += int(cc)
     return total
 
 
@@ -124,16 +184,32 @@ def compute_landcover(state: str, tract_shp: Path, year: int, out_dir: Path, out
     tile_paths = download_tiles(tiles, year, out_dir / "wc_tiles")
     tile_paths_by_ll = {p.stem.split("_")[-2]: p for p in tile_paths}
 
+    out_dir.mkdir(parents=True, exist_ok=True)
+    skipped_path = out_dir / f"skipped_oversized_tracts_{state.lower()}.txt"
+    skipped_geoids = set()
+
     val_dict = {}
     for _, row in tqdm(tracts.iterrows(), total=len(tracts), desc=f"[{state}] Clipping tracts"):
+        geoid = str(int(row.GEOID))
         try:
-            counts = tract_class_counts(row.geometry, tiles, tile_paths_by_ll)
-            if counts:
-                val_dict[str(int(row.GEOID))] = dict(counts)
-        except Exception as e:
-            print(f"  {row.GEOID}: failed ({e})")
+            def _log_skip(reason, geoid=geoid):
+                skipped_geoids.add(geoid)
+                with open(skipped_path, "a") as f:
+                    f.write(f"{geoid}\t{reason}\n")
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+            counts = tract_class_counts(row.geometry, tiles, tile_paths_by_ll, on_skip=_log_skip)
+            if counts:
+                val_dict[geoid] = dict(counts)
+        except Exception as e:
+            print(f"  {geoid}: failed ({e})")
+
+    if skipped_geoids:
+        print(f"[{state}] Skipped {len(skipped_geoids)} oversized tract(s) "
+              f"(logged to {skipped_path}) -- these tracts are missing from "
+              f"lc.csv. Cross-check against geoetl's skipped_oversized_aois.txt "
+              f"for this state; if they overlap, those tracts have no imagery "
+              f"either and are already excluded by the analysis scripts' joins.")
+
     raw_path = out_dir / f"raw_counts_{state.lower()}.json"
     with open(raw_path, "w") as f:
         json.dump(val_dict, f)
@@ -180,6 +256,16 @@ def main():
     state = args.state.upper()
     tract_shp = args.tract_shp or Path(DEFAULT_SHP[state])
     out_csv = args.out_csv or Path(f"./lc_{state.lower()}.csv")
+    if tract_shp.is_dir():
+        raise SystemExit(
+            f"--tract-shp {tract_shp} is a directory, not a .shp file. If it "
+            f"contains multiple tract layers (e.g. both "
+            f"tl_2019_{STATE_FIPS[state]}_tract.shp and "
+            f"tl_2019_{STATE_FIPS[state]}_tract_wi.shp), geopandas will "
+            f"silently pick one of them rather than the one you meant. Point "
+            f"this at the .shp file directly, e.g.:\n"
+            f"  --tract-shp {tract_shp / f'tl_2019_{STATE_FIPS[state]}_tract_wi.shp'}"
+        )
     if not tract_shp.exists():
         raise SystemExit(
             f"Tract shapefile not found: {tract_shp}\n"
