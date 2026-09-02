@@ -5,3 +5,4 @@ wc
 *csv
 *.ipynb_checkpoints*
 __pycache__/
+1_data_prep/test_lc/
