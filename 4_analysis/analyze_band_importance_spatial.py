@@ -36,6 +36,7 @@ Outputs (under OUT_DIR):
     morans_i_bar.png               Moran's I per band, significance marked
 """
 
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -46,22 +47,16 @@ from scipy.spatial import cKDTree
 from scipy.sparse import csr_matrix
 
 
-# -------------------------------------------------------------------------
-# Config -- <<< fill these in
-# -------------------------------------------------------------------------
-PER_IMAGE_CSV = "./band_importance_per_image.csv"  # <<< change me
-LC_CSV = "./lc.csv"                                 # <<< change me
-OUT_DIR = Path("./out_band_importance_spatial")     # <<< change me
-
 # Same thresholds as analyze_seasonality_lag.py -- keep these in sync if
 # you change one.
 AG_CROPLAND_THRESHOLD = 0.30
 URBAN_BUILT_THRESHOLD = 0.30
 
-# Bands/groups to actually test and plot -- <<< adjust to whatever this
-# quarter's CSV has columns for (band_importance.band_names / .groups in
-# the sail config that produced it).
-BAND_COLUMNS = ["B02", "B03", "B04", "B08", "B11", "B12"]
+# Default bands to test and plot when --band-columns isn't given -- assumes
+# this quarter's CSV has RGB+NIR+SWIR columns (band_importance.band_names
+# in the sail config that produced it). Override with --band-columns for a
+# different band set.
+DEFAULT_BAND_COLUMNS = ["B02", "B03", "B04", "B08", "B11", "B12"]
 
 # k-NN neighborhood size for the spatial weight matrix, and permutation
 # count for Moran's I's significance test.
@@ -269,13 +264,28 @@ def h3b_spatial_autocorrelation(panel, band_columns, out_dir, k=KNN_K, n_perm=MO
 # main
 # -------------------------------------------------------------------------
 def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    p = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--state", required=True, help="State label, e.g. oh/az/ca/ga/pa (used for output naming only)")
+    p.add_argument("--per-image-csv", required=True, type=Path,
+                    help="band_importance_per_image.csv from sail's task: band_importance")
+    p.add_argument("--lc-csv", required=True, type=Path,
+                    help="lc.csv (e.g. from compute_landcover.py)")
+    p.add_argument("--out-dir", type=Path, default=None,
+                    help="Output dir (default: ./out_band_importance_spatial/<state>)")
+    p.add_argument("--band-columns", default=",".join(DEFAULT_BAND_COLUMNS),
+                    help=f"Comma-separated band names to test (default: {','.join(DEFAULT_BAND_COLUMNS)})")
+    args = p.parse_args()
 
-    panel = load_and_join(PER_IMAGE_CSV, LC_CSV)
-    panel.to_csv(OUT_DIR / "per_image_with_landscape.csv", index=False)
+    band_columns = args.band_columns.split(",")
+    out_dir = args.out_dir or Path(f"./out_band_importance_spatial/{args.state.lower()}")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    h3a_landscape_moderation(panel, BAND_COLUMNS, OUT_DIR)
-    h3b_spatial_autocorrelation(panel, BAND_COLUMNS, OUT_DIR)
+    panel = load_and_join(args.per_image_csv, args.lc_csv)
+    panel.to_csv(out_dir / "per_image_with_landscape.csv", index=False)
+
+    h3a_landscape_moderation(panel, band_columns, out_dir)
+    h3b_spatial_autocorrelation(panel, band_columns, out_dir)
 
 
 if __name__ == "__main__":

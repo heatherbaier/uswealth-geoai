@@ -30,6 +30,7 @@ Outputs (under OUT_DIR):
     h2a_seasonal_summary.csv         per-band growing vs non-growing test
 """
 
+import argparse
 import re
 from pathlib import Path
 
@@ -39,21 +40,10 @@ import matplotlib.pyplot as plt
 from scipy import stats
 
 
-# -------------------------------------------------------------------------
-# Config -- <<< fill these in
-# -------------------------------------------------------------------------
-QUARTERS = [
-    # {"year": 2016, "quarter": 1,
-    #  "csv": "/data/hbaier/new_data/tlag/az_imagery/q1_2016_s2_allbands/artifacts/az_q1_2016_allbands_v1/band_importance.csv"},
-    # ... one entry per quarter with a trained checkpoint + band_importance run,
-    # or build with discover_quarters() below
-]
-
-OUT_DIR = Path("./out_band_importance")  # <<< change me
-
 # <<< Same Ohio-corn-belt assumption (and same AZ caveat) as
 # analyze_pixel_diversity_accuracy.py -- verify against real AZ NDVI/
-# cropping-calendar data before trusting H2a here.
+# cropping-calendar data before trusting H2a here. Override with
+# --growing-quarters per state.
 GROWING_QUARTERS = {2, 3}
 NON_GROWING_QUARTERS = {1, 4}
 
@@ -93,12 +83,6 @@ def discover_quarters(artifacts_root, csv_name="band_importance.csv"):
 
     print(f"discover_quarters: found {len(quarters)} usable quarters under {artifacts_root}")
     return quarters
-
-
-# Set this to auto-populate QUARTERS instead of listing entries by hand.
-ARTIFACTS_ROOT = None   # <<< e.g. "/data/hbaier/new_data/tlag/az_imagery"
-if ARTIFACTS_ROOT:
-    QUARTERS = discover_quarters(ARTIFACTS_ROOT)
 
 
 # -------------------------------------------------------------------------
@@ -199,23 +183,41 @@ def plot_band_importance_by_quarter(panel, out_path):
 # main
 # -------------------------------------------------------------------------
 def main():
-    if not QUARTERS:
+    global GROWING_QUARTERS, NON_GROWING_QUARTERS
+
+    p = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--state", required=True, help="State label, e.g. oh/az/ca/ga/pa (used for output naming only)")
+    p.add_argument("--artifacts-root", required=True, type=Path,
+                    help="State imagery root to scan for band_importance.csv per quarter, e.g. .../az_imagery")
+    p.add_argument("--out-dir", type=Path, default=None,
+                    help="Output dir (default: ./out_band_importance/<state>)")
+    p.add_argument("--growing-quarters", default="2,3",
+                    help="Comma-separated growing-season quarters (default: 2,3 -- Ohio corn-belt; "
+                         "override per state once real phenology data is available)")
+    args = p.parse_args()
+
+    GROWING_QUARTERS = {int(q) for q in args.growing_quarters.split(",")}
+    NON_GROWING_QUARTERS = {1, 2, 3, 4} - GROWING_QUARTERS
+
+    out_dir = args.out_dir or Path(f"./out_band_importance/{args.state.lower()}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    quarters = discover_quarters(args.artifacts_root)
+    if not quarters:
         raise SystemExit(
-            "QUARTERS is empty -- fill in {year, quarter, csv} entries at "
-            "the top of this script (one per quarter with a completed "
-            "task: band_importance run), or set ARTIFACTS_ROOT."
+            f"No usable quarters found under {args.artifacts_root} -- run "
+            f"sail's task: band_importance for at least one quarter first."
         )
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    panel = build_panel(QUARTERS)
-    panel.to_csv(OUT_DIR / "band_importance_panel.csv", index=False)
-    print(f"Panel: {len(panel):,} band-quarter rows across "
+    panel = build_panel(quarters)
+    panel.to_csv(out_dir / "band_importance_panel.csv", index=False)
+    print(f"[{args.state}] Panel: {len(panel):,} band-quarter rows across "
           f"{panel[['year', 'quarter']].drop_duplicates().shape[0]} quarters, "
           f"{panel['band_name'].nunique()} bands")
 
-    plot_band_importance_by_quarter(panel, OUT_DIR / "band_importance_by_quarter.png")
-    h2a_seasonal_importance(panel, OUT_DIR)
+    plot_band_importance_by_quarter(panel, out_dir / "band_importance_by_quarter.png")
+    h2a_seasonal_importance(panel, out_dir)
 
 
 if __name__ == "__main__":

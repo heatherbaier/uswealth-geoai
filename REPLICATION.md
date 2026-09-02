@@ -47,63 +47,76 @@ further, `4_analysis` last.
 
 Getting tract geometries, wealth labels, and land-cover fractions ready.
 None of these scripts talk to `geoetl`/`sail` — they're pure data prep, run
-once per state.
+once per state. As of this rewrite, every script here (except OH's
+already-done label join, which nothing in this repo reproduces) is driven
+by `--state` — no more per-state copy-pasted notebooks.
 
 ### `download_acs_tracts.py`
 Downloads Census TIGER/Line tract shapefiles for a given ACS 5-year period
 (all 50 states + DC, or a subset). ACS 2015–2019 pairs with TIGER 2019.
 ```
-python download_acs_tracts.py --acs-period 2015-2019 --output-dir ./tracts_2019
+python download_acs_tracts.py --acs-period 2015-2019 --output-dir ./data/tracts2019
 ```
-Output: one shapefile per state under `--output-dir`.
+Output: one shapefile per state under `--output-dir` (`<output-dir>/<STATE>/tl_2019_<fips>_tract.shp`).
 
-### `clean_wealth_index_{az,ca,ga,pa}.ipynb`
+### `clean_wealth_index.py`
 Joins a state's tract shapefile to `final_wealth_indices_2019.csv` (the
 ACS-derived wealth index — not produced by anything in this repo; expected
-to already exist at the path each notebook's second cell points to), and
-writes:
+to already exist at the path `--wealth-csv` points to), and writes:
 - `<state>_wi2019.csv` — GEOID + `wealth_index_overall_core`
-- `<tract_shapefile>_wi.shp` — the tract shapefile with wealth index attached
-
+- `tl_2019_<fips>_tract_wi.shp` — the tract shapefile with wealth index attached
+```
+python clean_wealth_index.py --state az
+python clean_wealth_index.py --state ca --tracts-dir ./data/tracts2019 \
+    --wealth-csv ./final_wealth_indices_2019.csv
+```
 This is what `geoetl`'s AZ/CA/GA/PA configs point `aoi.path` at
 (`tl_2019_<fips>_tract_wi.shp`), and what `params.label_column: wealth_ind`
-in those configs reads from. **There is no equivalent notebook for OH in
-this repo** — OH's label join was apparently done before this repo's
-history starts (OH's `geoetl` configs point at
-`tl_2019_39_tract_proj.shp`, a plain-projected shapefile without a `_wi`
-suffix, and its `label_column: NAME` is a placeholder, not a real wealth
-label — worth double-checking OH's actual label source before writing up
-OH results, since it isn't reproducible from anything currently in this
-repo).
+in those configs reads from.
 
-To do PA/CA/GA end to end, run `download_acs_tracts.py` first, then the
-matching notebook here.
+Replaces the four near-identical `clean_wealth_index_{az,ca,ga,pa}.ipynb`
+notebooks this repo used to have. While merging them into this script, one
+of the four (PA) turned out to have a real bug: it wrote its output to
+`tl_2019_42_tract.shp` (no `_wi` suffix), silently overwriting the plain
+source shapefile instead of writing a separate wealth-index-joined file
+like the other three notebooks did. This script always writes the `_wi`
+suffix — if PA's original shapefile was already overwritten by that bug,
+re-run `download_acs_tracts.py` for PA before trusting its `_wi.shp`.
 
-### `compute_landcover_oh.py`
-**OH-specific and incomplete as a pipeline — read this before using it.**
-Downloads ESA WorldCover 10m tiles overlapping Ohio, clips to each tract,
-and counts pixels per WorldCover class. This is the "get land cover for
-OH" script referenced elsewhere in this doc.
+`--state oh` is rejected on purpose. **There is no equivalent for OH** —
+OH's label join was apparently done before this repo's history starts
+(OH's `geoetl` configs point at `tl_2019_39_tract_proj.shp`, a
+plain-projected shapefile without a `_wi` suffix, and its
+`label_column: NAME` is a placeholder, not a real wealth label — worth
+double-checking OH's actual label source before writing up OH results,
+since it isn't reproducible from anything currently in this repo).
 
-What it actually produces: `./test.json` (yes, that's the literal
-filename in the script — rename it if you run this again), mapping
-`GEOID -> {ESA class code: pixel count}` using ESA's *numeric* class codes
-(10=Tree cover, 30=Grassland, 40=Cropland, 50=Built-up, etc.).
+To do a new state end to end: `download_acs_tracts.py` first, then this.
 
-**What's missing:** `4_analysis/analyze_seasonality_lag.py` and
-`4_analysis/analyze_band_importance_spatial.py` both expect a `lc.csv`
-with *named* fraction columns (`Cropland`, `Built-up`, ...), not this raw
-numeric-class-code JSON. There is currently no script in this repo that
-does that conversion (remap ESA codes to names, normalize counts to
-fractions, write to CSV). If you're re-deriving land cover for a new
-state, you'll need to write that conversion step, or ask for it — it's a
-short script (rename `test.json`'s class-code keys via the ESA WorldCover
-legend, divide by row totals, pivot to one column per class), just not
-built yet.
+### `compute_landcover.py`
+Downloads ESA WorldCover 10m tiles overlapping a state's tracts, clips to
+each tract, and writes a ready-to-use `lc.csv` — named fraction columns
+(`Cropland`, `Built-up`, `Tree cover`, ...), one row per GEOID.
+```
+python compute_landcover.py --state oh
+python compute_landcover.py --state az --tract-shp ./data/tracts2019/AZ/tl_2019_04_tract_wi.shp
+```
+Output: `./lc_<state>.csv` (the `lc.csv` that `analyze_seasonality_lag.py`,
+`analyze_pixel_diversity_accuracy.py` (H1c), and
+`analyze_band_importance_spatial.py` all take as input), plus the raw
+per-class pixel counts at `<out-dir>/raw_counts_<state>.json` for
+debugging.
 
-Hardcoded to `./data/tracts2019/OH/tl_2019_39_tract_proj.shp` — copy and
-retarget for another state rather than editing in place, or generalize it
-to take `--state`/`--shapefile` args.
+Replaces the OH-only `compute_landcover_oh.py`/`lc.py`, which (a) was
+hardcoded to OH's shapefile and (b) only ever opened *one* WorldCover
+tile after downloading all of them that intersected the AOI — silently
+wrong/incomplete for any state whose tracts span more than one 3°x3°
+WorldCover tile, which is most states larger than Ohio (AZ/CA/PA
+especially). This version clips each tract against every tile it actually
+intersects and sums counts across tiles. It also does the ESA
+class-code → named-fraction conversion directly, which used to be a
+missing manual step (the old script only wrote raw numeric-class-code
+counts to a file literally named `./test.json`).
 
 ---
 
@@ -126,36 +139,42 @@ rework this session did). Don't use this for new states.
 ## 3_validation/
 
 Sanity-checking a trained checkpoint before trusting it enough to run the
-`4_analysis/` scripts against it. Both notebooks just load `sail`'s
-per-quarter prediction CSVs (`epoch<N>_valset_preds.csv` /
-`epoch<N>_full_preds.csv`, written by `sail`'s `task: validate` — see
-`sail/src/sail/engine.py::run_validation`) and compute R², mean signed
+`4_analysis/` scripts against it.
+
+### `validate.py`
+Auto-discovers every quarter under a state's imagery root that has a
+completed `sail` `task: validate` run (`epoch<N>_preds.csv` /
+`epoch<N>_valset_preds.csv` / `epoch<N>_full_preds.csv`, written by
+`sail/src/sail/engine.py::run_validation`), and computes R², mean signed
 error (bias), and error std per quarter.
+```
+python validate.py --state oh --imagery-root /data/hbaier/new_data/tlag/imagery
+python validate.py --state az --imagery-root /data/hbaier/new_data/tlag/az_imagery
+```
+Output: `validation_summary_<state>.csv` plus `r2_by_quarter.png` /
+`bias_by_quarter.png` / `std_by_quarter.png` under `--out-dir` (default
+`./out_validation/<state>`).
 
-### `validation_oh.ipynb`
-The original, for OH's (pre-AZ-rework) trained models. Loads 15 quarters
-(q2_2016 .. q4_2019) from hardcoded `/data/hbaier/new_data/tlag/imagery/...`
-paths.
-
-### `validation_az.ipynb`
-**Work in progress — not a finished AZ replication yet.** Only the first
-cell was updated to point at the AZ q1_2016 all-bands checkpoint
-(`.../az_imagery/q1_2016_s2_allbands/artifacts/az_q1_2016_allbands_v1/epoch174_valset_preds.csv`).
-Every cell after that still has the *original OH* paths copy-pasted from
-`validation_oh.ipynb`, unedited — running this notebook as-is would mix
-one AZ quarter with several OH quarters into the same `stats`/`error`/`std`
-lists and plot them together as if they were a single continuous series.
-Fix the remaining cells' paths to AZ's other quarters (once trained)
-before trusting this notebook's plots.
+Replaces `validation_oh.ipynb` and `validation_az.ipynb` — the same
+~35-cell notebook copy-pasted per state (and, for AZ, left half-finished
+mid-copy: only its first cell had been updated to an AZ path, the rest
+still pointed at OH's). Also fixes a bug those notebooks had: their x-axis
+tick labels were a hardcoded 15-entry list assuming every state has
+exactly q2_2016..q4_2019 trained, which silently produces mislabeled or
+truncated plots for any state with a different quarter range (i.e. every
+state except OH, today). This script's tick labels are built from
+whatever quarters it actually finds.
 
 ---
 
 ## 4_analysis/
 
 The actual paper analyses. Every script here is standalone (no imports
-between them) with a `<<< change me` config block near the top — fill
-those in, then `python <script>.py`. Each one writes its outputs to its own
-`OUT_DIR`.
+between them) and driven entirely by CLI arguments (`--state` plus
+whatever paths that analysis needs) — `python <script>.py --help` for the
+full list. Each one writes its outputs to `--out-dir` (default: a
+per-state subfolder under `./out_<analysis_name>/`), so running the same
+script for a second state never overwrites the first state's output.
 
 ### Thread: pixel diversity vs. accuracy
 Theory: non-growing-season imagery is spectrally flatter (less pixel-to-
@@ -170,30 +189,42 @@ especially in rural/agricultural tracts.
    python compute_pixel_diversity.py --chip-dir <geoetl output.root>/chips \
        --sensor sentinel2 --out ./diversity/q1_2016.csv
    ```
-2. **`analyze_pixel_diversity_accuracy.py`** — joins each quarter's
-   diversity CSV to that quarter's `sail` prediction CSV (on chip
-   filename), then tests: is diversity itself seasonal (H1a); does
-   diversity predict per-chip accuracy, both magnitude and signed bias,
-   including within a single quarter (H1b); is the effect stronger in
-   agricultural tracts (H1c, needs `lc.csv` — see the gap noted under
-   `compute_landcover_oh.py` above). Fill in `QUARTERS` or set
-   `IMAGERY_ROOT` to auto-discover.
+2. **`analyze_pixel_diversity_accuracy.py`** — auto-discovers every
+   quarter under `--imagery-root`, joins each one's diversity CSV to that
+   quarter's `sail` prediction CSV (on chip filename), then tests: is
+   diversity itself seasonal (H1a); does diversity predict per-chip
+   accuracy, both magnitude and signed bias, including within a single
+   quarter (H1b); is the effect stronger in agricultural tracts (H1c,
+   needs `--lc-csv` from `compute_landcover.py`).
+   ```
+   python analyze_pixel_diversity_accuracy.py --state az \
+       --imagery-root /data/hbaier/new_data/tlag/az_imagery \
+       --diversity-dir ./diversity --lc-csv ./lc_az.csv \
+       --growing-quarters 2,3
+   ```
 
 ### Thread: seasonal accuracy trends by landscape
-### `analyze_seasonality_lag.py`
-Takes a wide-format `preds.csv` (`GEOID`, `q<n>_<year>_pred`,
-`q<n>_<year>_error` columns) + `lc.csv` (land cover fractions), and tests:
-per-quarter R²/RMSE by landscape type; per-quarter *signed bias* by
-landscape (does the model systematically over/under-predict wealth in a
-given season, and does that differ by urban/rural); seasonal-amplitude and
-temporal-slope comparisons; mixed models on both accuracy and bias with
-quarter×landscape and time×landscape interactions.
-
-**Known gap:** nothing in this repo currently assembles that wide
-`preds.csv` from `sail`'s per-quarter long-format prediction CSVs (the
-`epoch<N>_..._preds.csv` files `3_validation/` reads directly) — you'd
-need to pivot GEOID×quarter yourself, or ask for that assembly script.
-`lc.csv` has the same gap noted above under `compute_landcover_oh.py`.
+1. **`assemble_preds_wide.py`** — auto-discovers every quarter under
+   `--imagery-root` and pivots `sail`'s per-quarter long-format prediction
+   CSVs (GEOID from the chip filename, same convention as everywhere
+   else in this doc) into the wide-format `preds.csv`
+   (`GEOID`, `q<n>_<year>_pred`, `q<n>_<year>_error`) the next script needs.
+   ```
+   python assemble_preds_wide.py --state az \
+       --imagery-root /data/hbaier/new_data/tlag/az_imagery \
+       --out ./preds_az.csv
+   ```
+2. **`analyze_seasonality_lag.py`** — takes that wide `preds.csv` +
+   `lc.csv` (land cover fractions), and tests: per-quarter R²/RMSE by
+   landscape type; per-quarter *signed bias* by landscape (does the model
+   systematically over/under-predict wealth in a given season, and does
+   that differ by urban/rural); seasonal-amplitude and temporal-slope
+   comparisons; mixed models on both accuracy and bias with
+   quarter×landscape and time×landscape interactions.
+   ```
+   python analyze_seasonality_lag.py --state az \
+       --preds-csv ./preds_az.csv --lc-csv ./lc_az.csv
+   ```
 
 ### Thread: seasonal band contribution
 1. In `sail`, run `task: band_importance` per quarter's checkpoint (see
@@ -205,38 +236,47 @@ need to pivot GEOID×quarter yourself, or ask for that assembly script.
    individual bands), and `band_importance_per_image.csv` (per-tract, via
    ablation-to-mean rather than permutation — see the same file's docstring
    for why per-tract needs a different mechanism than the dataset-wide test).
-2. **`analyze_band_importance_seasonality.py`** — pools `band_importance.csv`
-   across quarters, tests whether each band's importance is itself seasonal
-   (growing vs. non-growing) and plots it by quarter. Needs multiple
-   quarters trained to say anything (one quarter has no season comparison
-   to make).
+2. **`analyze_band_importance_seasonality.py`** — auto-discovers
+   `band_importance.csv` per quarter under `--artifacts-root`, pools them,
+   tests whether each band's importance is itself seasonal (growing vs.
+   non-growing) and plots it by quarter. Needs multiple quarters trained
+   to say anything (one quarter has no season comparison to make).
+   ```
+   python analyze_band_importance_seasonality.py --state az \
+       --artifacts-root /data/hbaier/new_data/tlag/az_imagery --growing-quarters 2,3
+   ```
 3. **`analyze_band_importance_spatial.py`** — takes one quarter's
    `band_importance_per_image.csv` + `lc.csv`, tests whether a band's
    per-tract importance differs by landscape (ag vs. urban), and computes
    Moran's I spatial autocorrelation (does a band matter in geographic
    clusters, or is its importance scattered randomly) with a permutation
    significance test.
-4. `az_band_importance.ipynb` — scratch notebook, currently just loads and
-   sorts `band_importance.csv`. Not a real analysis yet.
+   ```
+   python analyze_band_importance_spatial.py --state az \
+       --per-image-csv .../band_importance_per_image.csv --lc-csv ./lc_az.csv
+   ```
 
 **AZ-specific caveat that affects H1a/H2's "growing season" tests:** all
-three scripts currently assume `GROWING_QUARTERS = {2, 3}` (Ohio corn-belt
+three scripts default `--growing-quarters` to `2,3` (Ohio corn-belt
 phenology). This is very likely wrong for AZ — irrigated winter cropping
 and desert winter-rain green-up don't follow the corn-belt calendar. A
-wrong split would hide a real seasonal effect, not fake one. Get real AZ
-NDVI/cropping-calendar data before trusting seasonal-split results for AZ.
+wrong split would hide a real seasonal effect, not fake one. Pass the real
+AZ growing quarters via `--growing-quarters` once real
+NDVI/cropping-calendar data is available — don't trust the default for AZ.
 
 ---
 
 ## Open gaps, as of this writing
 
-- No script converts `compute_landcover_oh.py`'s raw ESA class-code JSON
-  into the named-fraction `lc.csv` the analysis scripts need.
-- No script assembles a wide-format `preds.csv` from `sail`'s per-quarter
-  prediction CSVs for `analyze_seasonality_lag.py`.
-- `validation_az.ipynb` is a half-finished copy of `validation_oh.ipynb`.
-- `GROWING_QUARTERS`/`NON_GROWING_QUARTERS` in the band-importance and
-  pixel-diversity scripts need real AZ phenology data, not the Ohio
-  assumption they currently default to.
+- `GROWING_QUARTERS`/`--growing-quarters` in the band-importance and
+  pixel-diversity scripts still *default* to the Ohio assumption
+  (`2,3`) — the flag exists now, but nobody has plugged in real AZ (or
+  CA/GA/PA) phenology data yet, so every run for those states needs that
+  flag passed explicitly once that data exists.
 - OH's wealth-index label provenance isn't reproducible from anything in
-  this repo (see the note under `clean_wealth_index_*.ipynb`).
+  this repo (see the note under `clean_wealth_index.py`).
+- CA/GA/PA don't have imagery downloaded/trained yet, so none of
+  `3_validation/` or `4_analysis/`'s per-state commands have actually been
+  run for them — the scripts should work unchanged (they're state-agnostic
+  now), but that's untested until there's real data to point `--imagery-root`
+  / `--artifacts-root` at.
