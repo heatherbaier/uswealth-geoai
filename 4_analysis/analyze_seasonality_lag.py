@@ -23,6 +23,7 @@ Outputs:
       on both squared error (accuracy) and signed error (bias)
 """
 
+import argparse
 import re
 from pathlib import Path
 
@@ -33,13 +34,6 @@ from scipy import stats
 from sklearn.metrics import r2_score
 import statsmodels.formula.api as smf
 
-
-# -------------------------------------------------------------------------
-# Config
-# -------------------------------------------------------------------------
-PREDS_CSV = "./preds.csv"   # <<< change me
-LC_CSV    = "./lc.csv"     # <<< change me
-OUT_DIR   = Path("/home/hbaier/projects/tlags_v2/out")   # <<< change me
 
 # Thresholds for the categorical typology. Adjust after looking at
 # lc_df[["Cropland", "Built-up"]].hist() on your actual data.
@@ -434,41 +428,58 @@ def plot_bias_curves(bias_q, out_path):
 # main
 # -------------------------------------------------------------------------
 def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    p = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--state", required=True, help="State label, e.g. oh/az/ca/ga/pa (used for output naming only)")
+    p.add_argument("--preds-csv", required=True, type=Path,
+                    help="Wide-format preds CSV (see assemble_preds_wide.py)")
+    p.add_argument("--lc-csv", required=True, type=Path,
+                    help="lc.csv (e.g. from compute_landcover.py)")
+    p.add_argument("--out-dir", type=Path, default=None,
+                    help="Output dir (default: ./out_seasonality_lag/<state>)")
+    p.add_argument("--require-complete-tracts", action="store_true",
+                    help="Drop tracts that aren't present in every discovered quarter "
+                         "(matches this script's original OH-only behavior; off by "
+                         "default since most states won't have every quarter trained yet)")
+    args = p.parse_args()
 
-    preds, lc = load_and_merge(PREDS_CSV, LC_CSV)
+    out_dir = args.out_dir or Path(f"./out_seasonality_lag/{args.state.lower()}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    preds, lc = load_and_merge(args.preds_csv, args.lc_csv)
     long = to_long(preds)
 
-    # In the script, right after building 'long':
-    tracts_all_quarters = long.dropna(subset=["pred"]).groupby("GEOID").size()
-    complete_tracts = tracts_all_quarters[tracts_all_quarters == 15].index
-    long = long[long["GEOID"].isin(complete_tracts)]
-    
+    if args.require_complete_tracts:
+        n_quarters = long[["year", "quarter"]].drop_duplicates().shape[0]
+        tracts_all_quarters = long.dropna(subset=["pred"]).groupby("GEOID").size()
+        complete_tracts = tracts_all_quarters[tracts_all_quarters == n_quarters].index
+        long = long[long["GEOID"].isin(complete_tracts)]
+
     panel = long.merge(lc, on="GEOID", how="inner")
-    print(f"Panel size: {len(panel):,} rows "
-          f"({panel['GEOID'].nunique():,} tracts × "
+    print(f"[{args.state}] Panel size: {len(panel):,} rows "
+          f"({panel['GEOID'].nunique():,} tracts x "
           f"{panel[['year','quarter']].drop_duplicates().shape[0]} quarters)")
 
-    panel.to_csv(OUT_DIR / "panel_long.csv", index=False)
+    panel.to_csv(out_dir / "panel_long.csv", index=False)
 
     per_q = per_quarter_metrics(panel)
-    per_q.to_csv(OUT_DIR / "per_quarter_metrics.csv", index=False)
+    per_q.to_csv(out_dir / "per_quarter_metrics.csv", index=False)
     print("\nPer-quarter R² summary (first 12 rows):")
     print(per_q.head(12).to_string(index=False))
 
-    plot_r2_curves(per_q, OUT_DIR / "r2_curves_by_landscape.png")
+    plot_r2_curves(per_q, out_dir / "r2_curves_by_landscape.png")
 
     bias_q = bias_by_quarter(panel)
-    bias_q.to_csv(OUT_DIR / "bias_by_quarter.csv", index=False)
+    bias_q.to_csv(out_dir / "bias_by_quarter.csv", index=False)
     print("\nPer-quarter bias summary (first 12 rows):")
     print(bias_q.head(12).to_string(index=False))
-    plot_bias_curves(bias_q, OUT_DIR / "bias_curves_by_landscape.png")
+    plot_bias_curves(bias_q, out_dir / "bias_curves_by_landscape.png")
 
     print("\n" + "=" * 70)
     print("TEST A — SEASONAL AMPLITUDE (ag vs urban)")
     print("=" * 70)
     amp, diffs = seasonal_amplitude_test(per_q)
-    amp.to_csv(OUT_DIR / "seasonal_amplitude.csv", index=False)
+    amp.to_csv(out_dir / "seasonal_amplitude.csv", index=False)
 
     print("\n" + "=" * 70)
     print("TEST B — TEMPORAL SLOPE (ag vs urban)")

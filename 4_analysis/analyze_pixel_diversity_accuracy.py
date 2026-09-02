@@ -60,6 +60,7 @@ Outputs (under OUT_DIR):
     h1_summary.txt                 all printed stats, captured to a file
 """
 
+import argparse
 import re
 from pathlib import Path
 
@@ -68,19 +69,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import stats
 import statsmodels.formula.api as smf
-
-
-# -------------------------------------------------------------------------
-# Config -- <<< fill these in
-# -------------------------------------------------------------------------
-QUARTERS = [
-    # {"year": 2016, "quarter": 2,
-    #  "preds_csv": "/data/hbaier/new_data/tlag/az_imagery/q2_2016_s2/artifacts/q2_2016_v1/epoch178_preds.csv",
-    #  "diversity_csv": "./diversity/az_q2_2016.csv"},
-    # ... one entry per quarter, or build with discover_quarters() below
-]
-
-OUT_DIR = Path("./out_pixel_diversity")  # <<< change me
 
 
 def discover_quarters(imagery_root, diversity_dir, preds_glob="artifacts/*/epoch*preds.csv"):
@@ -130,25 +118,16 @@ def discover_quarters(imagery_root, diversity_dir, preds_glob="artifacts/*/epoch
     return quarters
 
 
-# Set this to auto-populate QUARTERS instead of listing entries by hand
-# above, e.g. "/data/hbaier/new_data/tlag/az_imagery". Run
-# compute_pixel_diversity.py for each quarter's chips first, writing to
-# DIVERSITY_DIR/q{quarter}_{year}.csv.
-IMAGERY_ROOT = None   # <<< e.g. "/data/hbaier/new_data/tlag/az_imagery"
-DIVERSITY_DIR = "./diversity"
-if IMAGERY_ROOT:
-    QUARTERS = discover_quarters(IMAGERY_ROOT, DIVERSITY_DIR)
-
-# <<< This Q2/Q3-vs-Q1/Q4 split assumes Ohio corn-belt phenology (growing
-# ~April-September) and is very likely WRONG for Arizona: AZ agriculture is
-# irrigated (Yuma/Phoenix-area cropland grows through the winter -- lettuce,
-# citrus -- with a summer dormant/fallow period instead), and Sonoran desert
-# vegetation greens up after winter rains, not in summer heat. Since AZ is
-# the state actually being run first, get the real bimonthly NDVI/greenness
-# cycle for AZ cropland (e.g. from MODIS NDVI or USDA cropping calendars)
-# before trusting H1a/H1c here -- a wrong growing-season split would show up
-# as a false negative (real seasonality washed out by mislabeled quarters),
-# not a false positive.
+# <<< The default Q2/Q3-vs-Q1/Q4 growing-season split assumes Ohio
+# corn-belt phenology (growing ~April-September) and is very likely WRONG
+# for Arizona: AZ agriculture is irrigated (Yuma/Phoenix-area cropland
+# grows through the winter -- lettuce, citrus -- with a summer
+# dormant/fallow period instead), and Sonoran desert vegetation greens up
+# after winter rains, not in summer heat. Override with
+# --growing-quarters/--non-growing-quarters for AZ (and any other state)
+# once real NDVI/cropping-calendar data is available -- a wrong split
+# would show up as a false negative (real seasonality washed out by
+# mislabeled quarters), not a false positive.
 GROWING_QUARTERS = {2, 3}
 NON_GROWING_QUARTERS = {1, 4}
 
@@ -158,10 +137,8 @@ NON_GROWING_QUARTERS = {1, 4}
 # back to raw RGB spread otherwise.
 DIVERSITY_METRIC_PRIORITY = ["ndvi_std", "mean_band_std"]
 
-# Chip filename stem IS the GEOID (see module docstring). Only needed for
-# H1c; set to None to skip H1c even if LC_CSV is provided.
+# Chip filename stem IS the GEOID (see module docstring).
 GEOID_FROM_NAME = lambda name: Path(name).stem
-LC_CSV = None             # e.g. "./lc.csv" -- set this to run H1c
 
 
 # -------------------------------------------------------------------------
@@ -391,26 +368,51 @@ def h1c_landscape_moderation(panel, metric, lc_csv, out_dir):
 # main
 # -------------------------------------------------------------------------
 def main():
-    if not QUARTERS:
+    global GROWING_QUARTERS, NON_GROWING_QUARTERS
+
+    p = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--state", required=True, help="State label, e.g. oh/az/ca/ga/pa (used for output naming only)")
+    p.add_argument("--imagery-root", required=True, type=Path,
+                    help="geoetl tlag imagery root for this state, e.g. .../tlag/az_imagery")
+    p.add_argument("--diversity-dir", type=Path, default=Path("./diversity"),
+                    help="Where compute_pixel_diversity.py wrote q{quarter}_{year}.csv per quarter")
+    p.add_argument("--lc-csv", type=Path, default=None,
+                    help="lc.csv (e.g. from compute_landcover.py) -- set to run H1c; omitted skips H1c")
+    p.add_argument("--out-dir", type=Path, default=None,
+                    help="Output dir (default: ./out_pixel_diversity/<state>)")
+    p.add_argument("--growing-quarters", default="2,3",
+                    help="Comma-separated growing-season quarters (default: 2,3 -- Ohio corn-belt; "
+                         "override per state once real phenology data is available)")
+    args = p.parse_args()
+
+    GROWING_QUARTERS = {int(q) for q in args.growing_quarters.split(",")}
+    NON_GROWING_QUARTERS = {1, 2, 3, 4} - GROWING_QUARTERS
+
+    out_dir = args.out_dir or Path(f"./out_pixel_diversity/{args.state.lower()}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    quarters = discover_quarters(args.imagery_root, args.diversity_dir)
+    if not quarters:
         raise SystemExit(
-            "QUARTERS is empty -- fill in {year, quarter, preds_csv, diversity_csv} "
-            "entries at the top of this script before running."
+            f"No usable quarters found under {args.imagery_root}. Run "
+            f"compute_pixel_diversity.py against each quarter's chip dir first."
         )
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    panel = build_panel(QUARTERS)
-    panel.to_csv(OUT_DIR / "panel.csv", index=False)
-    print(f"\nPanel: {len(panel):,} chip-quarter rows across "
+    panel = build_panel(quarters)
+    panel.to_csv(out_dir / "panel.csv", index=False)
+    print(f"\n[{args.state}] Panel: {len(panel):,} chip-quarter rows across "
           f"{panel[['year', 'quarter']].drop_duplicates().shape[0]} quarters")
 
     metric = pick_metric(panel)
     print(f"Using diversity metric: {metric}")
 
-    h1a_seasonal_diversity(panel, metric, OUT_DIR)
-    h1b_diversity_predicts_error(panel, metric, OUT_DIR)
-    h1c_landscape_moderation(panel, metric, LC_CSV, OUT_DIR) if LC_CSV else \
-        print("\nH1c skipped: LC_CSV not set.")
+    h1a_seasonal_diversity(panel, metric, out_dir)
+    h1b_diversity_predicts_error(panel, metric, out_dir)
+    if args.lc_csv:
+        h1c_landscape_moderation(panel, metric, args.lc_csv, out_dir)
+    else:
+        print("\nH1c skipped: --lc-csv not given.")
 
 
 if __name__ == "__main__":
