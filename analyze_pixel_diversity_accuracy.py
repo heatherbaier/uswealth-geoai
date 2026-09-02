@@ -18,29 +18,45 @@ That's three separable, testable sub-claims, run in order below:
        have higher error, INCLUDING within a single quarter (i.e. this
        isn't only "winter chips are worse" restated -- a flat chip should
        cost you accuracy even relative to other chips shot the same
-       quarter, e.g. a cloudy/hazy summer chip).
+       quarter, e.g. a cloudy/hazy summer chip). Also tests the signed
+       version: does a flat chip bias the prediction in a consistent
+       direction (e.g. dormancy reading as "less developed"), not just
+       make it noisier either way.
   H1c  The diversity-accuracy relationship (and the seasonal dip in
        diversity) is bigger in agricultural/rural tracts than urban ones.
        Only runs if GEOID_FROM_NAME is filled in and LC_CSV is provided.
 
 Inputs
 ------
-QUARTERS: list of dicts, one per quarter already validated in
-    validation.ipynb: {"year", "quarter", "preds_csv", "diversity_csv"}.
-    preds_csv is the existing per-quarter model output (columns include
-    "name", "pred", "label"). diversity_csv is the output of
+QUARTERS: list of dicts, one per quarter: {"year", "quarter", "preds_csv",
+    "diversity_csv"}. preds_csv is the existing per-quarter model output
+    (columns include "name", "pred", "label") like the ones loaded in
+    validation.ipynb. diversity_csv is the output of
     compute_pixel_diversity.py run against that same quarter's raw chip
-    directory. The two are joined on chip FILENAME (not full path), since
-    they may have been produced from different machines/mounts.
+    directory ("<imagery_root>/q{q}_{year}_s2/chips"). The two are joined
+    on chip FILENAME (not full path), since they may have been produced
+    from different machines/mounts. Build this list by hand, or use
+    discover_quarters() below to scan an imagery root that follows
+    geoetl's tlag layout (see configs/tlags/*.yml in the geoetl repo).
 
-GEOID_FROM_NAME / LC_CSV: optional, only needed for H1c. LC_CSV uses the
-    same format as analyze_seasonality_lag.py's lc.csv (GEOID index, named
-    land-cover fraction columns).
+GEOID_FROM_NAME: chip files are named "{GEOID}.tif" directly -- geoetl's
+    pipeline.py writes each chip to
+    os.path.join(chips_dir, f"{aoi_id}.{chip_ext}") where
+    aoi_id = str(row[uid_column]) and every tlag config sets
+    uid_column: GEOID. So Path(name).stem IS the GEOID; no regex needed.
+    (Spot-check this against one real filename before trusting H1c --
+    this is read from geoetl's current pipeline code, not verified against
+    an actual chip on disk.)
+
+LC_CSV: optional, only needed for H1c. Same format as
+    analyze_seasonality_lag.py's lc.csv (GEOID index, named land-cover
+    fraction columns).
 
 Outputs (under OUT_DIR):
     panel.csv                      merged chip-quarter panel
     diversity_by_quarter.csv/.png  H1a
-    diversity_error_scatter.png    H1b
+    diversity_error_scatter.png    H1b (magnitude: diversity vs |error|)
+    diversity_bias_scatter.png     H1b (direction: diversity vs signed error)
     h1_summary.txt                 all printed stats, captured to a file
 """
 
@@ -59,16 +75,80 @@ import statsmodels.formula.api as smf
 # -------------------------------------------------------------------------
 QUARTERS = [
     # {"year": 2016, "quarter": 2,
-    #  "preds_csv": "/data/hbaier/new_data/tlag/imagery/q2_2016_s2/artifacts/q2_2016_v1/epoch178_preds.csv",
-    #  "diversity_csv": "./diversity/q2_2016.csv"},
-    # ... one entry per quarter (q2_2016 .. q4_2019 for OH, per validation.ipynb)
+    #  "preds_csv": "/data/hbaier/new_data/tlag/az_imagery/q2_2016_s2/artifacts/q2_2016_v1/epoch178_preds.csv",
+    #  "diversity_csv": "./diversity/az_q2_2016.csv"},
+    # ... one entry per quarter, or build with discover_quarters() below
 ]
 
 OUT_DIR = Path("./out_pixel_diversity")  # <<< change me
 
-# Ohio (corn belt) growing season ~ April-September. Revisit per state when
-# this analysis is extended to AZ/CA/GA/PA -- desert/irrigated/multi-crop
-# regions won't share this quarter split.
+
+def discover_quarters(imagery_root, diversity_dir, preds_glob="artifacts/*/epoch*preds.csv"):
+    """
+    Scan imagery_root for geoetl tlag-style quarter directories
+    (q{1-4}_{year}_s2, per configs/tlags/*.yml in the geoetl repo) and
+    build a QUARTERS list automatically.
+
+    For each quarter directory found, this looks for exactly one file
+    matching preds_glob under it (handles both "*_preds.csv" and
+    "*_valset_preds.csv" as seen in validation.ipynb) and expects
+    compute_pixel_diversity.py to have already been run on
+    "<quarter_dir>/chips", writing its output to
+    "<diversity_dir>/q{quarter}_{year}.csv".
+
+    Quarters with zero or more than one preds-csv match are skipped with a
+    warning rather than guessed at.
+    """
+    imagery_root = Path(imagery_root)
+    diversity_dir = Path(diversity_dir)
+    quarters = []
+    for qdir in sorted(imagery_root.glob("q[1-4]_????_s2")):
+        m = re.match(r"q([1-4])_(\d{4})_s2", qdir.name)
+        if not m:
+            continue
+        quarter, year = int(m.group(1)), int(m.group(2))
+
+        matches = sorted(qdir.glob(preds_glob))
+        if len(matches) != 1:
+            print(f"Skipping {qdir.name}: found {len(matches)} preds CSVs "
+                  f"matching '{preds_glob}' (expected exactly 1)")
+            continue
+
+        div_csv = diversity_dir / f"q{quarter}_{year}.csv"
+        if not div_csv.exists():
+            print(f"Skipping {qdir.name}: expected diversity CSV not found "
+                  f"at {div_csv} -- run compute_pixel_diversity.py on "
+                  f"{qdir / 'chips'} first")
+            continue
+
+        quarters.append({
+            "year": year, "quarter": quarter,
+            "preds_csv": str(matches[0]), "diversity_csv": str(div_csv),
+        })
+
+    print(f"discover_quarters: found {len(quarters)} usable quarters under {imagery_root}")
+    return quarters
+
+
+# Set this to auto-populate QUARTERS instead of listing entries by hand
+# above, e.g. "/data/hbaier/new_data/tlag/az_imagery". Run
+# compute_pixel_diversity.py for each quarter's chips first, writing to
+# DIVERSITY_DIR/q{quarter}_{year}.csv.
+IMAGERY_ROOT = None   # <<< e.g. "/data/hbaier/new_data/tlag/az_imagery"
+DIVERSITY_DIR = "./diversity"
+if IMAGERY_ROOT:
+    QUARTERS = discover_quarters(IMAGERY_ROOT, DIVERSITY_DIR)
+
+# <<< This Q2/Q3-vs-Q1/Q4 split assumes Ohio corn-belt phenology (growing
+# ~April-September) and is very likely WRONG for Arizona: AZ agriculture is
+# irrigated (Yuma/Phoenix-area cropland grows through the winter -- lettuce,
+# citrus -- with a summer dormant/fallow period instead), and Sonoran desert
+# vegetation greens up after winter rains, not in summer heat. Since AZ is
+# the state actually being run first, get the real bimonthly NDVI/greenness
+# cycle for AZ cropland (e.g. from MODIS NDVI or USDA cropping calendars)
+# before trusting H1a/H1c here -- a wrong growing-season split would show up
+# as a false negative (real seasonality washed out by mislabeled quarters),
+# not a false positive.
 GROWING_QUARTERS = {2, 3}
 NON_GROWING_QUARTERS = {1, 4}
 
@@ -78,9 +158,10 @@ NON_GROWING_QUARTERS = {1, 4}
 # back to raw RGB spread otherwise.
 DIVERSITY_METRIC_PRIORITY = ["ndvi_std", "mean_band_std"]
 
-# Optional, for H1c only.
-GEOID_FROM_NAME = None   # e.g. lambda name: re.search(r"(\d{11})", name).group(1)
-LC_CSV = None             # e.g. "./lc.csv"
+# Chip filename stem IS the GEOID (see module docstring). Only needed for
+# H1c; set to None to skip H1c even if LC_CSV is provided.
+GEOID_FROM_NAME = lambda name: Path(name).stem
+LC_CSV = None             # e.g. "./lc.csv" -- set this to run H1c
 
 
 # -------------------------------------------------------------------------
@@ -215,6 +296,24 @@ def h1b_diversity_predicts_error(panel, metric, out_dir):
     )
     print(m.summary())
 
+    # Everything above is about error MAGNITUDE (do flat chips get noisier
+    # predictions). This is the same question for error DIRECTION: does a
+    # flat chip make the model over-predict or under-predict specifically,
+    # not just predict less accurately -- e.g. if winter dormancy reads as
+    # "less developed" to the model, flatter chips might systematically
+    # under-predict wealth rather than just being noisier either way.
+    r_signed, p_signed = stats.pearsonr(d[metric], d["error"])
+    print(f"\nSigned-error correlation, {metric} vs error (pred - truth):")
+    print(f"  Pearson r={r_signed:+.4f}, p={p_signed:.4g}")
+    print("(nonzero r = flatter chips bias predictions in a consistent "
+          "direction, not just noisier ones)")
+
+    print(f"\nOLS: error ~ {metric} + C(quarter), cluster-robust by quarter")
+    m_signed = smf.ols(f"error ~ {metric} + C(quarter)", data=d).fit(
+        cov_type="cluster", cov_kwds={"groups": d["quarter"].astype(str) + "_" + d["year"].astype(str)}
+    )
+    print(m_signed.summary())
+
     fig, ax = plt.subplots(figsize=(8, 6))
     sample = d.sample(min(5000, len(d)), random_state=0)
     ax.scatter(sample[metric], sample["abs_error"], s=6, alpha=0.25, color="tab:blue")
@@ -226,7 +325,18 @@ def h1b_diversity_predicts_error(panel, metric, out_dir):
     plt.savefig(out_dir / "diversity_error_scatter.png", dpi=150)
     plt.close()
 
-    return m
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.axhline(0, color="black", lw=1, alpha=0.6)
+    ax.scatter(sample[metric], sample["error"], s=6, alpha=0.25, color="tab:purple")
+    ax.set_xlabel(metric)
+    ax.set_ylabel("Signed error (pred − truth)")
+    ax.set_title(f"Pixel diversity vs. prediction bias\nPearson r={r_signed:+.3f} (p={p_signed:.3g})")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / "diversity_bias_scatter.png", dpi=150)
+    plt.close()
+
+    return m, m_signed
 
 
 # -------------------------------------------------------------------------
