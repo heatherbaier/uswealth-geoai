@@ -14,9 +14,13 @@ Inputs (both DataFrames indexed / keyed by tract GEOID):
 Outputs:
     - Long-format merged panel written to CSV
     - Per-quarter R² and RMSE by landscape group (CSV + figure)
+    - Per-quarter signed bias (mean pred - truth) by landscape group
+      (CSV + figure) -- does the model systematically over/under-predict
+      wealth in a given season, and does that break down by landscape?
     - Seasonal-amplitude paired comparison (agricultural vs urban)
     - Linear-slope-in-time comparison (agricultural vs urban)
-    - Mixed model summaries testing the landscape × time interactions
+    - Mixed model summaries testing the landscape × time interactions,
+      on both squared error (accuracy) and signed error (bias)
 """
 
 import re
@@ -140,6 +144,40 @@ def per_quarter_metrics(panel):
 
     out = (panel.groupby(["landscape", "year", "quarter"])
                 .apply(_metrics)
+                .reset_index())
+    out["t"] = (out["year"] - out["year"].min()) * 4 + (out["quarter"] - 1)
+    out["reliable"] = out["n"] >= MIN_CELL_N
+    return out.sort_values(["landscape", "t"]).reset_index(drop=True)
+
+
+# -------------------------------------------------------------------------
+# Step 2b — signed bias by quarter and landscape: does the model
+# systematically over- or under-predict wealth in a given season, and
+# does that direction depend on urban/rural?
+# -------------------------------------------------------------------------
+def bias_by_quarter(panel):
+    """
+    Mean signed error (pred - truth) per (landscape, year, quarter), plus
+    its standard error. Unlike per_quarter_metrics's R²/RMSE (magnitude
+    only), this is the metric that actually answers "does the model
+    systematically over/under-predict in a given season" -- R² and RMSE
+    would look identical whether errors are unbiased noise or a
+    consistent one-directional miss.
+    """
+    def _bias(g):
+        g = g.dropna(subset=["pred", "truth"])
+        n = len(g)
+        if n < 2:
+            return pd.Series({"n": n, "bias": np.nan, "bias_se": np.nan})
+        err = g["pred"] - g["truth"]
+        return pd.Series({
+            "n": n,
+            "bias": err.mean(),
+            "bias_se": err.std(ddof=1) / np.sqrt(n),
+        })
+
+    out = (panel.groupby(["landscape", "year", "quarter"])
+                .apply(_bias)
                 .reset_index())
     out["t"] = (out["year"] - out["year"].min()) * 4 + (out["quarter"] - 1)
     out["reliable"] = out["n"] >= MIN_CELL_N
@@ -272,6 +310,59 @@ def mixed_models(panel):
     return m1, m2
 
 
+def bias_mixed_models(panel):
+    """
+    Same two models as mixed_models(), but on SIGNED error instead of
+    squared error -- sq_err ~ ... tests whether the model gets noisier in
+    a season/landscape combination, err ~ ... tests whether it gets
+    systematically biased in one direction. Both are worth reporting: a
+    season could show no R²/RMSE change (mixed_models) while still
+    shifting from slight over-prediction to under-prediction (this one),
+    or vice versa.
+
+    Model 1 (seasonality × landscape):
+        err ~ C(quarter) * cropland_frac + (1 | GEOID)
+        A significant quarter main effect means the model over/under-
+        predicts wealth in that quarter on average, pooled across
+        landscapes. The interaction tests whether that directional bias
+        is bigger (or reverses sign) in more agricultural tracts.
+
+    Model 2 (temporal lag × landscape):
+        err ~ t * cropland_frac + (1 | GEOID)
+        Same idea for a linear drift in bias over the full study period,
+        rather than a within-year seasonal pattern.
+    """
+    d = panel.dropna(subset=["pred", "truth", "Cropland"]).copy()
+    d["err"] = d["pred"] - d["truth"]
+    d["cropland_c"] = d["Cropland"] - d["Cropland"].mean()
+
+    def _try_fit(formula, label):
+        print("\n" + "=" * 70)
+        print(f"{label}: {formula}")
+        print("=" * 70)
+        try:
+            m = smf.mixedlm(formula, data=d, groups=d["GEOID"]).fit(method="lbfgs")
+            print(m.summary())
+            return m
+        except np.linalg.LinAlgError as e:
+            print(f"Mixed model failed ({e}); falling back to OLS with cluster-robust SEs.")
+            m = smf.ols(formula, data=d).fit(
+                cov_type="cluster", cov_kwds={"groups": d["GEOID"]}
+            )
+            print(m.summary())
+            return m
+
+    m1 = _try_fit(
+        "err ~ C(quarter) * cropland_c",
+        "MODEL 1B (signed bias, seasonality × landscape): err ~ C(quarter) * cropland_c + (1|GEOID)",
+    )
+    m2 = _try_fit(
+        "err ~ t * cropland_c",
+        "MODEL 2B (signed bias, temporal lag × landscape): err ~ t * cropland_c + (1|GEOID)",
+    )
+    return m1, m2
+
+
 # -------------------------------------------------------------------------
 # Step 6 — plots
 # -------------------------------------------------------------------------
@@ -296,6 +387,41 @@ def plot_r2_curves(per_q, out_path):
     ax.set_xlabel("Quarter")
     ax.set_title("Per-quarter R² by landscape type\n(× = fewer than "
                  f"{MIN_CELL_N} tracts, treat cautiously)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"Saved {out_path}")
+
+
+def plot_bias_curves(bias_q, out_path):
+    """
+    Mean signed error (pred - truth) by quarter, one line per landscape,
+    with a zero reference line -- above zero means the model
+    over-predicts wealth that quarter, below means it under-predicts.
+    """
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.axhline(0, color="black", lw=1, alpha=0.6)
+    for landscape, color in [("agricultural", "tab:green"),
+                              ("urban",        "tab:red"),
+                              ("other",        "tab:gray")]:
+        sub = bias_q[bias_q["landscape"] == landscape].sort_values("t")
+        ax.errorbar(sub["t"], sub["bias"], yerr=sub["bias_se"],
+                     fmt="-o", label=landscape, color=color, alpha=0.9, capsize=3)
+        un = sub[~sub["reliable"]]
+        if len(un):
+            ax.plot(un["t"], un["bias"], "x", color=color, markersize=10, mew=2)
+
+    ticks = bias_q[["t", "year", "quarter"]].drop_duplicates().sort_values("t")
+    ax.set_xticks(ticks["t"])
+    ax.set_xticklabels([f"q{q}_{y}" for y, q in zip(ticks["year"], ticks["quarter"])],
+                       rotation=45, ha="right")
+    ax.set_ylabel("Mean signed error (pred − truth)")
+    ax.set_xlabel("Quarter")
+    ax.set_title("Per-quarter prediction bias by landscape type\n"
+                 "above 0 = over-predicts wealth, below 0 = under-predicts "
+                 f"(× = fewer than {MIN_CELL_N} tracts, treat cautiously)")
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -332,6 +458,12 @@ def main():
 
     plot_r2_curves(per_q, OUT_DIR / "r2_curves_by_landscape.png")
 
+    bias_q = bias_by_quarter(panel)
+    bias_q.to_csv(OUT_DIR / "bias_by_quarter.csv", index=False)
+    print("\nPer-quarter bias summary (first 12 rows):")
+    print(bias_q.head(12).to_string(index=False))
+    plot_bias_curves(bias_q, OUT_DIR / "bias_curves_by_landscape.png")
+
     print("\n" + "=" * 70)
     print("TEST A — SEASONAL AMPLITUDE (ag vs urban)")
     print("=" * 70)
@@ -344,6 +476,7 @@ def main():
     temporal_slope_test(per_q)
 
     mixed_models(panel)
+    bias_mixed_models(panel)
 
 
 if __name__ == "__main__":

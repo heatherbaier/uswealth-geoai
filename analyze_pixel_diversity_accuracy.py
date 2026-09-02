@@ -18,7 +18,10 @@ That's three separable, testable sub-claims, run in order below:
        have higher error, INCLUDING within a single quarter (i.e. this
        isn't only "winter chips are worse" restated -- a flat chip should
        cost you accuracy even relative to other chips shot the same
-       quarter, e.g. a cloudy/hazy summer chip).
+       quarter, e.g. a cloudy/hazy summer chip). Also tests the signed
+       version: does a flat chip bias the prediction in a consistent
+       direction (e.g. dormancy reading as "less developed"), not just
+       make it noisier either way.
   H1c  The diversity-accuracy relationship (and the seasonal dip in
        diversity) is bigger in agricultural/rural tracts than urban ones.
        Only runs if GEOID_FROM_NAME is filled in and LC_CSV is provided.
@@ -52,7 +55,8 @@ LC_CSV: optional, only needed for H1c. Same format as
 Outputs (under OUT_DIR):
     panel.csv                      merged chip-quarter panel
     diversity_by_quarter.csv/.png  H1a
-    diversity_error_scatter.png    H1b
+    diversity_error_scatter.png    H1b (magnitude: diversity vs |error|)
+    diversity_bias_scatter.png     H1b (direction: diversity vs signed error)
     h1_summary.txt                 all printed stats, captured to a file
 """
 
@@ -292,6 +296,24 @@ def h1b_diversity_predicts_error(panel, metric, out_dir):
     )
     print(m.summary())
 
+    # Everything above is about error MAGNITUDE (do flat chips get noisier
+    # predictions). This is the same question for error DIRECTION: does a
+    # flat chip make the model over-predict or under-predict specifically,
+    # not just predict less accurately -- e.g. if winter dormancy reads as
+    # "less developed" to the model, flatter chips might systematically
+    # under-predict wealth rather than just being noisier either way.
+    r_signed, p_signed = stats.pearsonr(d[metric], d["error"])
+    print(f"\nSigned-error correlation, {metric} vs error (pred - truth):")
+    print(f"  Pearson r={r_signed:+.4f}, p={p_signed:.4g}")
+    print("(nonzero r = flatter chips bias predictions in a consistent "
+          "direction, not just noisier ones)")
+
+    print(f"\nOLS: error ~ {metric} + C(quarter), cluster-robust by quarter")
+    m_signed = smf.ols(f"error ~ {metric} + C(quarter)", data=d).fit(
+        cov_type="cluster", cov_kwds={"groups": d["quarter"].astype(str) + "_" + d["year"].astype(str)}
+    )
+    print(m_signed.summary())
+
     fig, ax = plt.subplots(figsize=(8, 6))
     sample = d.sample(min(5000, len(d)), random_state=0)
     ax.scatter(sample[metric], sample["abs_error"], s=6, alpha=0.25, color="tab:blue")
@@ -303,7 +325,18 @@ def h1b_diversity_predicts_error(panel, metric, out_dir):
     plt.savefig(out_dir / "diversity_error_scatter.png", dpi=150)
     plt.close()
 
-    return m
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.axhline(0, color="black", lw=1, alpha=0.6)
+    ax.scatter(sample[metric], sample["error"], s=6, alpha=0.25, color="tab:purple")
+    ax.set_xlabel(metric)
+    ax.set_ylabel("Signed error (pred − truth)")
+    ax.set_title(f"Pixel diversity vs. prediction bias\nPearson r={r_signed:+.3f} (p={p_signed:.3g})")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / "diversity_bias_scatter.png", dpi=150)
+    plt.close()
+
+    return m, m_signed
 
 
 # -------------------------------------------------------------------------
