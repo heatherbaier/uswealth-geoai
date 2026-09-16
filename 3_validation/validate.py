@@ -101,7 +101,7 @@ def main():
     p.add_argument("--state", required=True, help="State label, e.g. oh/az/ca/ga/pa (used for output naming/titles only)")
     p.add_argument("--imagery-root", required=True, type=Path,
                     help="geoetl tlag imagery root for this state, e.g. .../tlag/az_imagery")
-    p.add_argument("--preds-glob", default="artifacts/*/epoch*preds.csv",
+    p.add_argument("--preds-glob", default="artifacts/*/epoch*_valset_preds.csv",
                     help="Glob (relative to each q<n>_<year>_s2*/ dir) for the validate-task output CSV")
     p.add_argument("--out-dir", type=Path, default=None,
                     help="Output dir (default: ./out_validation/<state>)")

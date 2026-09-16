@@ -31,7 +31,7 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 
-STATE_FIPS = {"AZ": "04", "CA": "06", "GA": "13", "PA": "42"}
+STATE_FIPS = {"AZ": "04", "CA": "06", "GA": "13", "PA": "42", "OH": "39"}
 
 
 def clean_wealth_index(state: str, tracts_dir: Path, wealth_csv: Path):
