@@ -93,6 +93,44 @@ since it isn't reproducible from anything currently in this repo).
 
 To do a new state end to end: `download_acs_tracts.py` first, then this.
 
+### `update_ys_labels.py`
+Regenerates sail-format `<prefix>_ys.json` (+ a matching `<prefix>_coords.json`)
+for one or more already-downloaded quarters, from the newer 6-variable
+partner ACS wealth CSV — without re-downloading any imagery. One new
+`<prefix>_<target>_ys.json`/`_coords.json` pair is written per
+`wealth_index_*` target (coords don't change per target, only labels do),
+so each variable becomes its own directly-trainable `sail` dataset via
+`dataset.prefix`.
+```
+python update_ys_labels.py \
+    --data-roots /data/hbaier/new_data/tlag/az_imagery/q1_2016_s2_allbands/ \
+                 /data/hbaier/new_data/tlag/az_imagery/q2_2016_s2_allbands/ \
+    --wealth-csv ./partner_acs_wealth.csv
+```
+Output: `<data_root>/<old_prefix>_<target>_ys.json` + `_coords.json` for
+each of the 6 `wealth_index_*` targets (override with `--targets`). GEOID
+matching is normalized (digits-only, zero-padded to 11) on both sides —
+see `normalize_geoid()`'s docstring for why a raw-string/int join isn't
+safe here (AZ's state FIPS `04` has already dropped its leading zero once).
+
+### `plot_wealth_variables.py`
+Visual sanity check on a state's wealth CSV before training on it: plots
+the state's tract polygons, one subplot per `wealth_index_*` target,
+colored by that target's value. Tracts with no matching CSV row are drawn
+gray rather than silently dropped, so you can see coverage at a glance.
+```
+python plot_wealth_variables.py --state az --wealth-csv ./partner_acs_wealth.csv
+```
+Output: `./wealth_variables_<state>.png` (override with `--out`). Reads
+`<tracts-dir>/<STATE>/tl_2019_<fips>_tract.shp` (the *raw* shapefile, not
+`clean_wealth_index.py`'s `_wi.shp`) and joins `--wealth-csv` directly in
+pandas — a `_wi.shp`-style join would risk silently colliding two of the
+6 variables into one column via the DBF format's 10-character field-name
+truncation (`wealth_index_housing_core` and `wealth_index_financial` both
+start `wealth_ind`). Same `normalize_geoid()` GEOID matching as
+`update_ys_labels.py`, imported directly from it rather than
+reimplemented, so both scripts can't drift apart on that logic.
+
 ### `compute_landcover.py`
 Downloads ESA WorldCover 10m tiles overlapping a state's tracts, clips to
 each tract, and writes a ready-to-use `lc.csv` — named fraction columns
