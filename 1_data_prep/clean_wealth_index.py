@@ -59,7 +59,7 @@ def clean_wealth_index(state: str, tracts_dir: Path, wealth_csv: Path):
 
     print(f"[{state}] Loading wealth index: {wealth_csv}")
     df = pd.read_csv(wealth_csv)
-    sub = df[df["geoid"].isin(gdf["GEOID"])][["geoid", "wealth_index_overall_core"]]
+    sub = df[df["geoid"].isin(gdf["GEOID"])][["geoid", "wealth_index"]]
     print(f"[{state}] Matched {len(sub):,} / {len(gdf):,} tracts to a wealth index row")
 
     wi_csv_path = state_dir / f"{state.lower()}_wi2019.csv"

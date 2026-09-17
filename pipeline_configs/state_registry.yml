@@ -36,8 +36,8 @@ az:
   # label_column) and sail/scripts/state_registry.yml (data_root_template,
   # base_prefix_template, spatial_block_deg, band_mean, band_std) -- AZ is
   # fully populated in both of those right now, just not copied here yet.
-  shp_path: null
-  label_column: null
+  shp_path: /home/hbaier/projects/tlags_v2/data/tracts2019/AZ/tl_2019_04_tract_wi.shp
+  label_column: wealth_ind
   data_root_template: null
   base_prefix_template: null
   in_channels: 12
@@ -49,8 +49,8 @@ ga:
   # TODO: same as AZ -- migrate from geoetl's/sail's old registries
   # (spatial_block_deg: 0.15 is already known from the real sweep; the
   # rest isn't filled in on either old registry yet either).
-  shp_path: null
-  label_column: null
+  shp_path: /home/hbaier/projects/tlags_v2/data/tracts2019/GA/tl_2019_13_tract_wi.shp
+  label_column: wealth_ind
   data_root_template: null
   base_prefix_template: null
   in_channels: 12

@@ -17,3 +17,4 @@ __pycache__/
 # tracked either way -- regenerate any time from the config + generator.
 configs/sail/
 configs/**/*.sh
+*slurm*

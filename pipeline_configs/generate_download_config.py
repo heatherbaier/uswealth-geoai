@@ -189,7 +189,7 @@ def main():
     p.add_argument("--walltime", default="144:00:00")
     p.add_argument("--partition", default="public")
     p.add_argument("--qos", default="public")
-    p.add_argument("--conda-env", default="geomain")
+    p.add_argument("--conda-env", default="/home/hbaier/.conda/envs/geoetl")
     p.add_argument("--repo-dir", default="/home/hbaier/packages/uswealth-geoai",
                     help="Working directory the SLURM job cd's into -- this project repo, "
                          "not geoetl (geoetl is used as an installed command, not by path)")
