@@ -32,10 +32,11 @@ examples and `sail`'s README/PR history for the config schema.
 
 `geoetl` and `sail` are both real, already pip-installable Python packages
 (see their own `pyproject.toml` — `geoetl`'s package is `geoetl`, `sail`'s
-is `sail` under `src/`). Neither needed any code changes to make
-`import geoetl` / `import sail` work from a script in *this* repo — they
-just needed to actually be installed into whatever environment you run
-this repo's scripts in, which `requirements.txt` now does:
+is `sail` under `src/`, with console-script entry points `geoetl` and
+`simba` respectively). Neither needed any code changes to make
+`import geoetl` / `import sail` — or running their installed `geoetl`/
+`simba` commands from anywhere — work. They just needed to actually be
+installed:
 
 ```
 git clone https://github.com/heatherbaier/geoetl ~/packages/geoetl
@@ -46,19 +47,34 @@ pip install -r requirements.txt
 ```
 
 (`requirements.txt`'s two `-e` lines point at `/home/hbaier/packages/geoetl`
-and `/home/hbaier/packages/sail` — the same sibling-repo layout the
-`geoetl`/`sail` SLURM job templates already assume. Edit those two paths
-first if your checkout lives somewhere else.)
+and `/home/hbaier/packages/sail`. Edit those two paths first if your
+checkout lives somewhere else.)
 
-This is additive, not a replacement: `geoetl --config ...` and
-`python launch.py --config ...` (run from inside those repos, as in their
-own SLURM job templates — see `geoetl`'s `scripts/generate_download_config.py`
-and `sail`'s `scripts/generate_train_config.py`/`generate_validate_config.py`)
-keep working exactly as before. What `pip install -r requirements.txt`
-adds is the option to `import geoetl` / `import sail` directly from a
-script *in this repo*, and — since `geoetl`'s console-script entry point
-(`geoetl = "geoetl.cli:app"`) gets installed too — the `geoetl` command
-also becomes runnable from any directory, not just `~/packages/geoetl`.
+Everything project-specific — which states, the imagery/naming
+convention, generating a ready-to-launch config for a given
+state/year/quarter/variable — lives **in this repo**, under
+`pipeline_configs/` (see its own docstrings): `state_registry.yml` (the one
+per-state registry both generators below read), `generate_download_config.py`
+(geoetl) and `generate_train_config.py`/`generate_validate_config.py`
+(sail). None of them need you to `cd` into `geoetl`/`sail` at any point —
+the SLURM jobs they generate `cd` into *this* repo and run the installed
+`geoetl`/`simba` commands directly. Generated configs land under
+`./configs/geoetl/` (tracked — a record of what was actually downloaded,
+same as `geoetl`'s own old `configs/tlags/` convention) and
+`./configs/sail/` (gitignored — fully reconstructible from
+`state_registry.yml`, matching `sail`'s own `configs/` being gitignored).
+
+So end to end, a replicator only ever needs to: clone all three repos,
+`pip install -r requirements.txt`, and run everything from inside this
+repo — `pipeline_configs/generate_download_config.py ... --launch`, then
+(once imagery exists) `pipeline_configs/generate_train_config.py ...
+--launch`, then `pipeline_configs/generate_validate_config.py ...
+--launch`. See `pa_replication.sh` for PA's exact sequence.
+
+`geoetl`'s/`sail`'s own `scripts/generate_*_config.py` + `state_registry.yml`
+(in those repos) are superseded by the above — kept there only because
+AZ/GA are still fully set up in *those* registries and not yet migrated to
+this repo's merged one (see `pipeline_configs/state_registry.yml`'s TODOs).
 
 ## Folder layout
 

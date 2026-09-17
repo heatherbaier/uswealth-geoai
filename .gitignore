@@ -6,3 +6,14 @@ wc
 *.ipynb_checkpoints*
 __pycache__/
 1_data_prep/test_lc/
+
+# sail train/validate configs are fully reconstructible from
+# pipeline_configs/state_registry.yml + generate_train_config.py /
+# generate_validate_config.py -- not worth versioning each run (matches
+# sail's own configs/ being gitignored). geoetl download configs ARE
+# tracked (configs/geoetl/) -- they're a record of what was actually
+# downloaded, matching geoetl's own configs/tlags/ convention. Generated
+# SLURM job files (both under configs/geoetl/ and configs/sail/) aren't
+# tracked either way -- regenerate any time from the config + generator.
+configs/sail/
+configs/**/*.sh

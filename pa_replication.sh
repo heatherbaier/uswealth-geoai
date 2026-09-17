@@ -20,22 +20,26 @@ cd ..
 python3 1_data_prep/compute_landcover.py --state pa \
     --tract-shp ./data/tracts2019/PA/tl_2019_42_tract_wi.shp
 
-# --- from here on, this repeats per quarter/year/variable, same as AZ/GA ---
+# --- from here on, this repeats per quarter/year/variable, same as AZ/GA.
+# Everything below runs from THIS repo's root -- no cd into geoetl/sail,
+# they only need to be pip-installed (see REPLICATION.md's Setup section
+# and ./requirements.txt). ---
 
-# 5. In geoetl: generate a download config + SLURM job, then sbatch it.
-#    (cd /home/hbaier/packages/geoetl first)
-#    python scripts/generate_download_config.py --state pa --year 2016 --quarter 1 --launch
+# 5. Generate a geoetl download config + SLURM job, then sbatch it.
+python3 pipeline_configs/generate_download_config.py --state pa --year 2016 --quarter 1 --launch
 
-# 6. Once imagery is downloaded for a few quarters: in sail, run
-#    find_spatial_block_deg.py and compute_shared_band_stats.py for PA and
-#    fill in its scripts/state_registry.yml entry (still null right now --
+# 6. Once imagery is downloaded for a few quarters: run sail's
+#    find_spatial_block_deg.py and compute_shared_band_stats.py
+#    (in ~/packages/sail/scripts/ -- these two are analysis/one-off tools,
+#    not part of the per-run config generation, so they're not duplicated
+#    here) for PA, and fill in pipeline_configs/state_registry.yml's pa
+#    entry (spatial_block_deg/band_mean/band_std -- still null right now,
 #    can't be computed without real downloaded imagery).
 
-# 7. In sail: generate a train config + SLURM job, then sbatch it.
-#    (cd /home/hbaier/packages/sail first)
-#    python scripts/generate_train_config.py --state pa --year 2016 --quarter 1 \
-#        --variable wealth_index_sat --launch
+# 7. Generate a sail train config + SLURM job, then sbatch it.
+python3 pipeline_configs/generate_train_config.py --state pa --year 2016 --quarter 1 \
+    --variable wealth_index_sat --launch
 
 # 8. Once trained: generate + sbatch the matching validate config.
-#    python scripts/generate_validate_config.py --state pa --year 2016 --quarter 1 \
-#        --variable wealth_index_sat --launch
+python3 pipeline_configs/generate_validate_config.py --state pa --year 2016 --quarter 1 \
+    --variable wealth_index_sat --launch
