@@ -157,11 +157,14 @@ def download_all(
     include_puerto_rico: bool = True,
     overwrite: bool = False,
     merged_output: Optional[Path] = None,
+    states: Optional[list] = None,
 ) -> dict:
     """
-    Download tract shapefiles for all states (and optionally PR) for the
-    given ACS 5-year period. Returns a dict mapping state abbrev -> shp path
-    (or None if failed).
+    Download tract shapefiles for the given ACS 5-year period -- every
+    state (+ optionally PR) by default, or just `states` if given (so
+    adding one new state later doesn't mean re-downloading and
+    re-extracting all 50+DC+PR again). Returns a dict mapping state
+    abbrev -> shp path (or None if failed).
     """
     tiger_year = tiger_year_for_acs(acs_period)
     print(f"\nACS period: {acs_period}")
@@ -172,10 +175,17 @@ def download_all(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    states_to_download = {
-        abbrev: fips for abbrev, fips in STATE_FIPS.items()
-        if include_puerto_rico or abbrev != 'PR'
-    }
+    if states is not None:
+        unknown = [s for s in states if s.upper() not in STATE_FIPS]
+        if unknown:
+            raise SystemExit(f"--states has unknown abbreviation(s): {unknown}. "
+                              f"Known: {sorted(STATE_FIPS)}")
+        states_to_download = {s.upper(): STATE_FIPS[s.upper()] for s in states}
+    else:
+        states_to_download = {
+            abbrev: fips for abbrev, fips in STATE_FIPS.items()
+            if include_puerto_rico or abbrev != 'PR'
+        }
 
     results = {}
     for abbrev, fips in sorted(states_to_download.items()):
@@ -283,6 +293,14 @@ def main():
         action='store_true',
         help='Re-download files even if they already exist',
     )
+    p.add_argument(
+        '--states',
+        nargs='+',
+        default=None,
+        help='Only download these state abbreviation(s) (e.g. --states PA), '
+             'instead of all 50 states + DC (+ PR). Useful for adding one '
+             'new state without re-downloading everything already on disk.',
+    )
     args = p.parse_args()
 
     download_all(
@@ -291,6 +309,7 @@ def main():
         include_puerto_rico=not args.no_puerto_rico,
         overwrite=args.overwrite,
         merged_output=args.merged_output,
+        states=args.states,
     )
 
 

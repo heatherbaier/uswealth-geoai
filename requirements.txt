@@ -1,0 +1,30 @@
+# Setup: see REPLICATION.md's "Setup" section for the full explanation.
+# `pip install -r requirements.txt` from this repo gets you:
+#   - `import geoetl` / `import sail` (both already real pip packages --
+#     see geoetl/pyproject.toml and sail/pyproject.toml -- editable-installed
+#     from wherever they're checked out on disk, matching the sibling-repo
+#     layout the geoetl/sail SLURM job templates already assume:
+#     /home/hbaier/packages/<repo>) usable from any script in this repo, in
+#     addition to (not instead of) their existing `geoetl --config ...` /
+#     `python launch.py --config ...` CLI workflows -- both keep working.
+#   - this repo's own dependencies, actually used across 1_data_prep/,
+#     3_validation/, 4_analysis/.
+#
+# If your checkout of geoetl/sail lives somewhere other than
+# /home/hbaier/packages/, edit the two -e paths below to match before
+# running pip install.
+
+-e /home/hbaier/packages/geoetl
+-e /home/hbaier/packages/sail
+
+geopandas
+pandas
+numpy
+matplotlib
+rasterio
+requests
+scipy
+scikit-learn
+statsmodels
+tqdm
+Pillow
