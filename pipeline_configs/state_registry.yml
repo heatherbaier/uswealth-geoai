@@ -1,0 +1,93 @@
+# The single, project-wide per-state registry for both generate_download_config.py
+# (geoetl) and generate_train_config.py/generate_validate_config.py (sail).
+# Lives here, not in geoetl/sail, because none of it is general-purpose
+# geoetl/sail functionality -- it's this specific paper's states, imagery
+# convention, and trained-model naming. geoetl/sail only need to be
+# installed (pip install -r ../requirements.txt); they don't need their
+# own copy of this file.
+#
+# Fields:
+#   shp_path / label_column       -- geoetl: the AOI shapefile (must already
+#     have the wealth index joined in -- see 1_data_prep/clean_wealth_index.py)
+#     and which tract column to pull labels from. Can't be derived from the
+#     state abbreviation alone (see AZ's "_wi" shapefile suffix).
+#   data_root_template / base_prefix_template -- sail: Python .format()
+#     strings (state/year/quarter), matching geoetl's output.root/dataset_name
+#     naming for that state exactly -- a sail dataset config pointed at the
+#     wrong data_root/prefix silently trains on nothing or the wrong imagery.
+#   in_channels                   -- sail model params (12 for the current
+#     full-Sentinel-2-band "_allbands" convention).
+#   spatial_block_deg             -- sail: from find_spatial_block_deg.py's
+#     real sweep against that state's tract layout. A value that works for
+#     one state can be wrong for another (see the AZ vs GA sweep discussion).
+#   band_mean / band_std          -- sail: from compute_shared_band_stats.py,
+#     pooled across that state's quarters -- NOT sail's per-quarter
+#     auto-computed default (erases cross-quarter flatness signal).
+#
+# AZ/GA are still fully set up under geoetl's/sail's OLD per-repo registries
+# (geoetl/scripts/state_registry.yml, sail/scripts/state_registry.yml) --
+# migrate their real values here when you go back to them; left as TODOs
+# below rather than re-typed from memory to avoid a transcription error.
+# PA is being set up fresh directly here, since it's starting from scratch
+# under this new setup.
+
+az:
+  # TODO: migrate from geoetl/scripts/state_registry.yml (shp_path,
+  # label_column) and sail/scripts/state_registry.yml (data_root_template,
+  # base_prefix_template, spatial_block_deg, band_mean, band_std) -- AZ is
+  # fully populated in both of those right now, just not copied here yet.
+  shp_path: null
+  label_column: null
+  data_root_template: null
+  base_prefix_template: null
+  in_channels: 12
+  spatial_block_deg: null
+  band_mean: null
+  band_std: null
+
+ga:
+  # TODO: same as AZ -- migrate from geoetl's/sail's old registries
+  # (spatial_block_deg: 0.15 is already known from the real sweep; the
+  # rest isn't filled in on either old registry yet either).
+  shp_path: null
+  label_column: null
+  data_root_template: null
+  base_prefix_template: null
+  in_channels: 12
+  spatial_block_deg: null
+  band_mean: null
+  band_std: null
+
+ca:
+  # Nothing computed yet, on the old registries or here.
+  shp_path: null
+  label_column: null
+  data_root_template: null
+  base_prefix_template: null
+  in_channels: 12
+  spatial_block_deg: null
+  band_mean: null
+  band_std: null
+
+pa:
+  # Follows AZ's exact established convention (fips 42): tl_2019_42_tract_wi.shp,
+  # written by 1_data_prep/clean_wealth_index.py --state PA --tracts-dir
+  # pointed at this same tlags_v2 location -- UNVERIFIED until that file is
+  # confirmed to actually exist on disk (generate_download_config.py only
+  # checks this field is non-null, not that the path resolves).
+  shp_path: /home/hbaier/projects/tlags_v2/data/tracts2019/PA/tl_2019_42_tract_wi.shp
+  label_column: wealth_ind
+  # Same naming formula generate_download_config.py's FIXED output.root/
+  # dataset_name uses for every state -- not PA-specific, just spelled out
+  # here so sail's dataset.data_root/prefix are guaranteed to match
+  # whatever geoetl actually downloads.
+  data_root_template: "/data/hbaier/new_data/tlag/pa_imagery/q{quarter}_{year}_s2_allbands/"
+  base_prefix_template: "pa_{year}_q{quarter}_s2_allbands"
+  in_channels: 12
+  # Not computed yet -- run find_spatial_block_deg.py once a few quarters
+  # of PA imagery are downloaded.
+  spatial_block_deg: null
+  # Not computed yet -- run compute_shared_band_stats.py once a few
+  # quarters of PA imagery are downloaded.
+  band_mean: null
+  band_std: null
