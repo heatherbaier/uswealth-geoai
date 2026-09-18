@@ -350,6 +350,53 @@ wrong split would hide a real seasonal effect, not fake one. Pass the real
 AZ growing quarters via `--growing-quarters` once real
 NDVI/cropping-calendar data is available — don't trust the default for AZ.
 
+### Thread: cross-quarter generalization
+
+Does a model trained on one quarter's imagery generalize to a *different*
+quarter's imagery of the same held-out locations — e.g. does a Q1-trained
+model still predict well on Q3 imagery? This only works because this
+project's `stable` split (`sail`'s `splitting.py`) makes a location's
+train/val/test bucket a pure function of its own identity + the shared
+per-state seed/split config — never of which other items happen to be
+present — so the SAME GEOIDs are held out across every quarter for a
+state. That's what makes "model A evaluated on model B's held-out
+imagery" a real, leak-free generalization test rather than an artifact of
+two unrelated random splits happening to overlap.
+
+1. **`pipeline_configs/generate_cross_validate_config.py`** — for one
+   already-trained model (`--model-year`/`--model-quarter`), generates a
+   `task: validate` config + SLURM job per quarter in `--imagery-quarters`,
+   each one evaluating that SAME model's checkpoint against a DIFFERENT
+   quarter's imagery, always restricted to that model's own held-out test
+   set (never the imagery quarter's own split). Include the model's own
+   quarter in `--imagery-quarters` to also get the diagonal entry in the
+   same batch. Run once per already-trained model (loop
+   `--model-year`/`--model-quarter` yourself) to build up a full grid.
+   ```
+   python pipeline_configs/generate_cross_validate_config.py \
+       --state az --variable wealth_index_sat \
+       --model-year 2016 --model-quarter 1 \
+       --imagery-quarters 2016Q1 2016Q2 2016Q3 2016Q4 --launch
+   ```
+   Requires `sail` PR #23 (dataset prefix in the validate output CSV
+   filename) — without it, evaluating the same model against several
+   imagery quarters would overwrite each run's predictions in that
+   model's `ckpt_dir`.
+2. **`4_analysis/build_cross_quarter_r2_matrix.py`** — once the jobs above
+   have run, reads each `(model quarter, imagery quarter)` pair's
+   prediction CSV directly (by the exact path the generator above would
+   produce, not a fragile glob), computes R² per cell, and writes the full
+   matrix as a CSV + a heatmap (diagonal cells outlined — that's each
+   model's own held-out test set, same numbers `3_validation/validate.py`
+   already reports one quarter at a time).
+   ```
+   python 4_analysis/build_cross_quarter_r2_matrix.py \
+       --state az --variable wealth_index_sat \
+       --quarters 2016Q1 2016Q2 2016Q3 2016Q4
+   ```
+   A blank cell means that pair hasn't been validated yet — this script
+   only reads what's already there, it doesn't run anything.
+
 ---
 
 ## Open gaps, as of this writing
