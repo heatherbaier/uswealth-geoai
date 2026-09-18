@@ -37,9 +37,7 @@ python3 pipeline_configs/generate_download_config.py --state ga --year 2019 --qu
 #    can't be computed without real downloaded imagery).
 
 # 7. Generate a sail train config + SLURM job, then sbatch it.
-python3 pipeline_configs/generate_train_config.py --state ga --year 2016 --quarter 1 \
-    --variable wealth_index_sat --launch
+python3 pipeline_configs/generate_train_config.py --state ga --year 2016 --quarter 1 --variable wealth_index_sat --launch
 
 # 8. Once trained: generate + sbatch the matching validate config.
-python3 pipeline_configs/generate_validate_config.py --state ga --year 2016 --quarter 1 \
-    --variable wealth_index_sat --launch
+python3 pipeline_configs/generate_validate_config.py --state ga --year 2016 --quarter 1 --variable wealth_index 

@@ -1,0 +1,30 @@
+aoi:
+  path: /home/hbaier/projects/tlags_v2/data/tracts2019/PA/tl_2019_42_tract_wi.shp
+catalog:
+  sensor: mpc_sentinel2
+  start_date: '2017-01-01'
+  end_date: '2017-03-31'
+  cloud_cover_max: 30
+  mask_clouds: false
+  bands:
+  - B01
+  - B02
+  - B03
+  - B04
+  - B05
+  - B06
+  - B07
+  - B08
+  - B8A
+  - B09
+  - B11
+  - B12
+auth:
+  mpc_api_key: null
+output:
+  root: /data/hbaier/new_data/tlag/pa_imagery/q1_2017_s2_allbands/
+  sub_root: false
+params:
+  uid_column: GEOID
+  label_column: wealth_ind
+  dataset_name: pa_2017_q1_s2_allbands

@@ -38,12 +38,12 @@ az:
   # fully populated in both of those right now, just not copied here yet.
   shp_path: /home/hbaier/projects/tlags_v2/data/tracts2019/AZ/tl_2019_04_tract_wi.shp
   label_column: wealth_ind
-  data_root_template: null
-  base_prefix_template: null
+  data_root_template: "/data/hbaier/new_data/tlag/az_imagery/q{quarter}_{year}_s2_allbands/"
+  base_prefix_template: "az_{year}_q{quarter}_s2_allbands"
   in_channels: 12
-  spatial_block_deg: null
-  band_mean: null
-  band_std: null
+  spatial_block_deg: .15
+  band_mean: [0.09006, 0.100938, 0.140538, 0.182718, 0.209559, 0.236259, 0.247468, 0.252709, 0.257845, 0.260785, 0.279013, 0.239055]
+  band_std: [0.061981, 0.066142, 0.071373, 0.087151, 0.086127, 0.083298, 0.084512, 0.087946, 0.085348, 0.084769, 0.09928, 0.095399]
 
 ga:
   # TODO: same as AZ -- migrate from geoetl's/sail's old registries
@@ -51,12 +51,12 @@ ga:
   # rest isn't filled in on either old registry yet either).
   shp_path: /home/hbaier/projects/tlags_v2/data/tracts2019/GA/tl_2019_13_tract_wi.shp
   label_column: wealth_ind
-  data_root_template: null
-  base_prefix_template: null
+  data_root_template: "/data/hbaier/new_data/tlag/ga_imagery/q{quarter}_{year}_s2_allbands/"
+  base_prefix_template: "ga_{year}_q{quarter}_s2_allbands"
   in_channels: 12
-  spatial_block_deg: null
-  band_mean: null
-  band_std: null
+  spatial_block_deg: 0.15
+  band_mean: [0.047564, 0.046274, 0.068636, 0.065091, 0.107091, 0.206508, 0.240632, 0.250842, 0.267487, 0.274737, 0.202095, 0.120538]
+  band_std:  [0.054595, 0.054495, 0.055723, 0.062511, 0.064379, 0.088588, 0.102902, 0.101381, 0.106818, 0.12025, 0.095319, 0.081527]
 
 ca:
   # Nothing computed yet, on the old registries or here.
