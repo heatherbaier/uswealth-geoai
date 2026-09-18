@@ -396,6 +396,23 @@ two unrelated random splits happening to overlap.
    ```
    A blank cell means that pair hasn't been validated yet — this script
    only reads what's already there, it doesn't run anything.
+3. **`4_analysis/analyze_cross_quarter_r2_structure.py`** — takes that
+   `r2_matrix.csv` and decomposes it: an additive two-way model
+   (`R² ~ mu + training-quarter effect + evaluation-quarter effect`, fit
+   by iterative mean-polish so it still works with a cell or two still
+   missing) with the variance-explained split between the additive model
+   and its residual; an SVD of the grand-mean-centered matrix (share of
+   squared Frobenius norm in the first component, full spectrum); the
+   asymmetry matrix `M - M^T` and its largest entries (needs a complete
+   matrix, unlike the additive fit); and two plots — an interaction/line
+   plot (one line per training quarter; parallel lines mean the additive
+   model fits well, crossing/fanning lines are the visual signature of
+   whatever the residual is picking up) and a heatmap of the residuals
+   themselves.
+   ```
+   python 4_analysis/analyze_cross_quarter_r2_structure.py \
+       --r2-matrix ./out_cross_quarter/az_wealth_index_sat/r2_matrix.csv
+   ```
 
 ---
 
