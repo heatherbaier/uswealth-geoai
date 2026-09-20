@@ -1,8 +1,21 @@
 """
 Sanity-check a state's trained checkpoints: R^2, mean signed error (bias),
 and error std dev per quarter, loaded straight from sail's `task: validate`
-output (epoch<N>_preds.csv / epoch<N>_valset_preds.csv / epoch<N>_full_preds.csv
--- see sail/src/sail/engine.py::run_validation).
+output (epoch<N>_valset_<dataset-prefix>_preds.csv /
+epoch<N>_full_<dataset-prefix>_preds.csv -- see
+sail/src/sail/engine.py::run_validation; the dataset-prefix segment was
+added in sail PR #23, so a config generated/validated before that PR
+produced the shorter epoch<N>_valset_preds.csv name instead -- re-run
+task: validate once to pick up the new name if --preds-glob below finds
+nothing for an older quarter).
+
+Only ever finds ONE match per quarter directory: this glob is
+non-recursive and looks directly under artifacts/<experiment>/, not
+artifacts/<experiment>/cross_quarter/ -- cross-quarter generalization
+runs (generate_cross_validate_config.py) deliberately write there instead
+(sail PR #25's validator.output_subdir) specifically so they don't show
+up here and break the "exactly 1 match = this model's own held-out test
+set" assumption this script depends on.
 
 Replaces the per-state validation_oh.ipynb / validation_az.ipynb notebooks
 (which were the same ~35 cells copy-pasted with different hardcoded paths,
@@ -101,7 +114,7 @@ def main():
     p.add_argument("--state", required=True, help="State label, e.g. oh/az/ca/ga/pa (used for output naming/titles only)")
     p.add_argument("--imagery-root", required=True, type=Path,
                     help="geoetl tlag imagery root for this state, e.g. .../tlag/az_imagery")
-    p.add_argument("--preds-glob", default="artifacts/*/epoch*_valset_preds.csv",
+    p.add_argument("--preds-glob", default="artifacts/*/epoch*_valset_*_preds.csv",
                     help="Glob (relative to each q<n>_<year>_s2*/ dir) for the validate-task output CSV")
     p.add_argument("--out-dir", type=Path, default=None,
                     help="Output dir (default: ./out_validation/<state>)")

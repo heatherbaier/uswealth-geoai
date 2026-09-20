@@ -72,6 +72,12 @@ from generate_validate_config import latest_existing_version  # noqa: E402
 
 IMAGERY_QUARTER_RE = re.compile(r"^(\d{4})Q([1-4])$", re.IGNORECASE)
 
+# Subfolder (under the model's own ckpt_dir) every cross-quarter prediction
+# CSV lands in -- see the validator.output_subdir comment in build_config.
+# build_cross_quarter_r2_matrix.py imports this rather than hardcoding it a
+# second time, so the two scripts can't drift apart on where to look.
+CROSS_QUARTER_SUBDIR = "cross_quarter"
+
 
 def parse_imagery_quarter(token: str):
     m = IMAGERY_QUARTER_RE.match(token.strip())
@@ -127,6 +133,17 @@ def build_config(state, variable, model_year, model_quarter,
         },
         "validator": {
             "device": device,
+            # Keep every cross-quarter prediction CSV (including the
+            # diagonal entry, if --imagery-quarters includes the model's
+            # own quarter) in its own subfolder under the model's
+            # ckpt_dir, separate from that model's normal single-quarter
+            # validate output (generate_validate_config.py, no
+            # output_subdir set) -- needs sail PR #25. Without this,
+            # once a model has been both normally validated AND
+            # cross-validated, 3_validation/validate.py's "exactly one
+            # epoch*_valset_*_preds.csv per quarter directory" glob would
+            # match more than one file.
+            "output_subdir": CROSS_QUARTER_SUBDIR,
         },
     }
     return cfg, experiment_name
