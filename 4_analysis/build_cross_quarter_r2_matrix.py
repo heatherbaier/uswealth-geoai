@@ -11,11 +11,15 @@ instead of a single quarter-by-quarter line.
 
 Doesn't run anything itself -- reads the epoch*_valset_<prefix>_preds.csv
 files sail's task: validate already wrote (see sail PR #23; each
-(model quarter, imagery quarter) pair gets its own uniquely-named CSV in
-the model's own ckpt_dir, which is what makes finding them by exact path
-here reliable instead of needing a "hope there's only one" glob). A blank
-cell in the output means that pair hasn't been validated yet -- generate
-and run that config first, this script doesn't fill in the gaps.
+(model quarter, imagery quarter) pair gets its own uniquely-named CSV,
+and PR #25's validator.output_subdir keeps them all in their own
+ckpt_dir/cross_quarter/ subfolder, separate from that model's normal
+single-quarter validate output -- see generate_cross_validate_config.py's
+CROSS_QUARTER_SUBDIR, imported here rather than hardcoded a second time).
+That's what makes finding them by exact path here reliable instead of
+needing a "hope there's only one" glob. A blank cell in the output means
+that pair hasn't been validated yet -- generate and run that config
+first, this script doesn't fill in the gaps.
 
 Usage:
     python 4_analysis/build_cross_quarter_r2_matrix.py \
@@ -40,7 +44,7 @@ from sklearn.metrics import r2_score
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline_configs"))
 from generate_train_config import load_registry, resolve_state_settings  # noqa: E402
 from generate_validate_config import latest_existing_version  # noqa: E402
-from generate_cross_validate_config import parse_imagery_quarter  # noqa: E402
+from generate_cross_validate_config import parse_imagery_quarter, CROSS_QUARTER_SUBDIR  # noqa: E402
 
 
 def model_ckpt_dir(state, variable, year, quarter, version, registry):
@@ -60,7 +64,12 @@ def imagery_prefix(state, variable, year, quarter, registry):
 
 
 def find_preds_csv(ckpt_dir: str, prefix: str):
-    pattern = os.path.join(ckpt_dir, f"epoch*_valset_{prefix}_preds.csv")
+    # generate_cross_validate_config.py routes every cell it generates
+    # (diagonal included) into ckpt_dir/<CROSS_QUARTER_SUBDIR>/ via
+    # validator.output_subdir (sail PR #25) -- not ckpt_dir directly,
+    # which is reserved for that model's own single-quarter validate
+    # output (generate_validate_config.py).
+    pattern = os.path.join(ckpt_dir, CROSS_QUARTER_SUBDIR, f"epoch*_valset_{prefix}_preds.csv")
     matches = sorted(glob.glob(pattern))
     if len(matches) == 0:
         return None
