@@ -86,8 +86,8 @@ pa:
   in_channels: 12
   # Not computed yet -- run find_spatial_block_deg.py once a few quarters
   # of PA imagery are downloaded.
-  spatial_block_deg: null
+  spatial_block_deg: 0.10
   # Not computed yet -- run compute_shared_band_stats.py once a few
   # quarters of PA imagery are downloaded.
-  band_mean: null
-  band_std: null
+  band_mean: [0.128026, 0.121163, 0.139011, 0.138074, 0.177431, 0.264479, 0.294966, 0.312072, 0.317942, 0.344258, 0.208909, 0.135835]
+  band_std: [0.193944, 0.18489, 0.176886, 0.179635, 0.173272, 0.15753, 0.15796, 0.163101, 0.153129, 0.186718, 0.088638, 0.082495]
