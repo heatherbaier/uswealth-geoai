@@ -297,7 +297,7 @@ def build_manifest_from_registry(state, variable, years, version, registry) -> p
     return pd.DataFrame(rows, columns=["year", "train_quarter", "eval_quarter", "preds_csv"])
 
 
-def _template_ckpt_dir(state, variable, year, quarter, version, data_root_template):
+def template_ckpt_dir(state, variable, year, quarter, version, data_root_template):
     data_root = data_root_template.format(state=state, year=year, quarter=quarter)
     data_root = data_root if data_root.endswith("/") else data_root + "/"
     output_dir = data_root + "artifacts/"
@@ -306,7 +306,7 @@ def _template_ckpt_dir(state, variable, year, quarter, version, data_root_templa
     return os.path.join(output_dir, f"{exp_base}_{v}")
 
 
-def _template_imagery_prefix(state, variable, year, quarter, base_prefix_template):
+def template_imagery_prefix(state, variable, year, quarter, base_prefix_template):
     base_prefix = base_prefix_template.format(state=state, year=year, quarter=quarter)
     return f"{base_prefix}_{variable}"
 
@@ -321,8 +321,8 @@ def build_manifest_from_templates(state, variable, years, version,
     rows, missing = [], []
     for year in years:
         for train_q, eval_q in REQUIRED_CELLS:
-            ckpt_dir = _template_ckpt_dir(state, variable, year, train_q, version, data_root_template)
-            prefix = _template_imagery_prefix(state, variable, year, eval_q, base_prefix_template)
+            ckpt_dir = template_ckpt_dir(state, variable, year, train_q, version, data_root_template)
+            prefix = template_imagery_prefix(state, variable, year, eval_q, base_prefix_template)
             csv_path = find_preds_csv(ckpt_dir, prefix)
             if csv_path is None:
                 missing.append((year, train_q, eval_q, f"not found under {ckpt_dir}"))
