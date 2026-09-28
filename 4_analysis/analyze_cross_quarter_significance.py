@@ -41,13 +41,25 @@ Usage:
     # OH, single year (matches "is the 2018 Q2 model on Q3 imagery
     # significantly worse than the 2018 Q3 model on its own set" exactly):
     python 4_analysis/analyze_cross_quarter_significance.py \
-        --state oh --variable wealth_index --quarters 2018Q1 2018Q2 2018Q3 2018Q4 \
-        --out-dir ./out_cross_quarter_sig/oh_2018_wealth_index
+        --states oh --variable wealth_index --quarters 2018Q1 2018Q2 2018Q3 2018Q4 \
+        --out-dir ./out_cross_quarter_sig
 
-    # AZ, already in state_registry.yml:
+    # Several states in one run -- --quarters/--variable apply to all of
+    # them, each state gets its own subfolder under --out-dir. Every state
+    # here has to actually have that variable/those quarters trained and
+    # cross-validated already; a state that doesn't just prints "no
+    # trained model found" for that row and moves on, same as a single-
+    # state run:
     python 4_analysis/analyze_cross_quarter_significance.py \
-        --state az --variable wealth_index_sat --quarters 2016Q1 2016Q2 2016Q3 2016Q4 \
-        --use-state-registry --out-dir ./out_cross_quarter_sig/az_wealth_index_sat
+        --states oh az ga pa --variable wealth_index --quarters 2018Q1 2018Q2 2018Q3 2018Q4 \
+        --out-dir ./out_cross_quarter_sig
+
+    # AZ, already in state_registry.yml (applies to every --states entry
+    # in the run, so mix registry-based and template-based states via
+    # separate invocations, not one --states list):
+    python 4_analysis/analyze_cross_quarter_significance.py \
+        --states az ga pa --variable wealth_index_sat --quarters 2016Q1 2016Q2 2016Q3 2016Q4 \
+        --use-state-registry --out-dir ./out_cross_quarter_sig
 """
 
 import argparse
@@ -248,37 +260,17 @@ def plot_significance_matrix(delta_r2: pd.DataFrame, significant: pd.DataFrame,
     print(f"Wrote {out_path}")
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--state", required=True)
-    p.add_argument("--variable", required=True)
-    p.add_argument("--quarters", required=True, nargs="+",
-                    help="YYYYQN tokens used as BOTH rows and columns, e.g. 2018Q1 2018Q2 2018Q3 2018Q4")
-    p.add_argument("--version", default=None, help="Trained version per row (default: latest existing)")
-    p.add_argument("--use-state-registry", action="store_true",
-                    help="Discover checkpoints via pipeline_configs/state_registry.yml (needs a full "
-                         "entry there) instead of --data-root-template/--base-prefix-template")
-    p.add_argument("--data-root-template", default=DEFAULT_DATA_ROOT_TEMPLATE,
-                    help=f"Default: {DEFAULT_DATA_ROOT_TEMPLATE!r}")
-    p.add_argument("--base-prefix-template", default=DEFAULT_BASE_PREFIX_TEMPLATE,
-                    help=f"Default: {DEFAULT_BASE_PREFIX_TEMPLATE!r}")
-    p.add_argument("--bootstrap-iters", type=int, default=2000,
-                    help="Paired bootstrap resamples per cell (default 2000)")
-    p.add_argument("--alpha", type=float, default=0.05, help="Significance threshold (default 0.05)")
-    p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--out-dir", default=None, help="Default: ./out_cross_quarter_sig/<state>_<variable>")
-    args = p.parse_args()
-
+def run_for_state(state, args, registry, base_out_dir: Path) -> "pd.DataFrame | None":
     quarters = [parse_imagery_quarter(t) for t in args.quarters]
-    registry = load_registry() if args.use_state_registry else None
-    ckpt_dir_fn, prefix_fn = resolve_ckpt_and_prefix(args.state.lower(), args.variable, args, registry)
+    ckpt_dir_fn, prefix_fn = resolve_ckpt_and_prefix(state, args.variable, args, registry)
 
+    print(f"\n{'=' * 70}\n{state.upper()} {args.variable}\n{'=' * 70}")
     delta_r2, p_value, significant, detail_df = build_significance_matrices(
-        args.state.lower(), args.variable, quarters, ckpt_dir_fn, prefix_fn,
+        state, args.variable, quarters, ckpt_dir_fn, prefix_fn,
         args.bootstrap_iters, args.alpha, args.seed,
     )
 
-    out_dir = Path(args.out_dir or f"./out_cross_quarter_sig/{args.state.lower()}_{args.variable}")
+    out_dir = base_out_dir / f"{state}_{args.variable}"
     out_dir.mkdir(parents=True, exist_ok=True)
     delta_r2.to_csv(out_dir / "delta_r2_matrix.csv")
     p_value.to_csv(out_dir / "p_value_matrix.csv")
@@ -287,11 +279,63 @@ def main():
     print(f"\nWrote {out_dir / 'delta_r2_matrix.csv'}, p_value_matrix.csv, significant_matrix.csv, "
           f"significance_detail.csv")
 
-    if not detail_df.empty:
-        n_sig = int(detail_df["significant"].sum())
-        print(f"\n{n_sig} / {len(detail_df)} off-diagonal cell(s) significant at alpha={args.alpha}")
-        plot_significance_matrix(delta_r2, significant, args.state, args.variable, args.alpha,
-                                  str(out_dir / "significance_matrix.png"))
+    if detail_df.empty:
+        print(f"[{state.upper()}] No cells tested -- nothing to plot.")
+        return detail_df
+
+    n_sig = int(detail_df["significant"].sum())
+    print(f"[{state.upper()}] {n_sig} / {len(detail_df)} off-diagonal cell(s) significant at "
+          f"alpha={args.alpha}")
+    plot_significance_matrix(delta_r2, significant, state, args.variable, args.alpha,
+                              str(out_dir / "significance_matrix.png"))
+
+    detail_df = detail_df.copy()
+    detail_df.insert(0, "state", state)
+    return detail_df
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--states", required=True, nargs="+",
+                    help="One or more state labels, e.g. --states oh, or --states oh az ga pa "
+                         "to run all of them in one invocation")
+    p.add_argument("--variable", required=True)
+    p.add_argument("--quarters", required=True, nargs="+",
+                    help="YYYYQN tokens used as BOTH rows and columns, e.g. 2018Q1 2018Q2 2018Q3 2018Q4 "
+                         "-- applies to every state in --states")
+    p.add_argument("--version", default=None, help="Trained version per row (default: latest existing)")
+    p.add_argument("--use-state-registry", action="store_true",
+                    help="Discover checkpoints via pipeline_configs/state_registry.yml (needs a full "
+                         "entry there for every state in --states) instead of --data-root-template/"
+                         "--base-prefix-template")
+    p.add_argument("--data-root-template", default=DEFAULT_DATA_ROOT_TEMPLATE,
+                    help=f"Default: {DEFAULT_DATA_ROOT_TEMPLATE!r}")
+    p.add_argument("--base-prefix-template", default=DEFAULT_BASE_PREFIX_TEMPLATE,
+                    help=f"Default: {DEFAULT_BASE_PREFIX_TEMPLATE!r}")
+    p.add_argument("--bootstrap-iters", type=int, default=2000,
+                    help="Paired bootstrap resamples per cell (default 2000)")
+    p.add_argument("--alpha", type=float, default=0.05, help="Significance threshold (default 0.05)")
+    p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--out-dir", default=None,
+                    help="Default: ./out_cross_quarter_sig -- each state gets its own "
+                         "<out-dir>/<state>_<variable>/ subfolder")
+    args = p.parse_args()
+
+    base_out_dir = Path(args.out_dir or "./out_cross_quarter_sig")
+    base_out_dir.mkdir(parents=True, exist_ok=True)
+    registry = load_registry() if args.use_state_registry else None
+
+    states = [s.lower() for s in args.states]
+    per_state_details = [run_for_state(state, args, registry, base_out_dir) for state in states]
+
+    if len(states) > 1:
+        combined = pd.concat([d for d in per_state_details if d is not None and not d.empty],
+                              ignore_index=True)
+        combined_path = base_out_dir / "significance_detail_all_states.csv"
+        combined.to_csv(combined_path, index=False)
+        n_sig = int(combined["significant"].sum()) if not combined.empty else 0
+        print(f"\n{'=' * 70}\nALL STATES: {n_sig} / {len(combined)} off-diagonal cell(s) significant "
+              f"at alpha={args.alpha} (see {combined_path})")
 
 
 if __name__ == "__main__":
