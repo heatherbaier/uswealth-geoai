@@ -57,21 +57,32 @@ Inputs this needs, none of which this script produces:
                  whatever CSV OH's actual wealth labels come from.
   --lc-csv       1_data_prep/compute_landcover.py's output
                  (`python compute_landcover.py --state oh` -> ./lc_oh.csv).
-  --ndvi-csv     optional, only for step 6. Long format: GEOID, year,
-                 quarter, ndvi_mean -- one row per tract per quarter per
-                 year. Nothing in this repo computes this today.
-  cross-quarter preds CSVs -- either:
-    (a) --state has a pipeline_configs/state_registry.yml entry (like
-        AZ/GA/PA) and generate_cross_validate_config.py has already been
-        run + validated for the 8 required (train_q, eval_q) cells below,
-        in which case this script finds them itself (same
-        model_ckpt_dir/imagery_prefix/find_preds_csv logic as
-        build_cross_quarter_r2_matrix.py -- imported from it, not
-        reimplemented); or
-    (b) OH is NOT in state_registry.yml today (it predates that
-        migration), so pass --preds-manifest instead: a CSV with columns
-        year, train_quarter, eval_quarter, preds_csv, one row per already-
-        validated cell (an epoch*_valset_<prefix>_preds.csv path).
+  --ndvi-csv     optional, only for step 6 -- fine to just leave out
+                 entirely, step 6 then prints one line saying it was
+                 skipped and every other step runs as normal. Long format:
+                 GEOID, year, quarter, ndvi_mean, one row per tract per
+                 quarter per year. Nothing in this repo computes this today.
+  cross-quarter preds CSVs -- three ways to point at these, in priority
+  order:
+    (a) --preds-manifest: an explicit CSV with columns year,
+        train_quarter, eval_quarter, preds_csv, one row per already-
+        validated cell.
+    (b) (default) auto-discovered from --data-root-template/
+        --base-prefix-template, which already default to the convention
+        every state's checkpoints actually use on disk (confirmed against
+        OH's real q2_2017 checkpoint: .../oh_imagery/q2_2017_s2_allbands/
+        artifacts/oh_q2_2017_wealth_index_v1/cross_quarter/epoch167_
+        valset_oh_2017_q1_s2_allbands_wealth_index_preds.csv) -- this
+        works for OH today without needing a state_registry.yml entry at
+        all, and for any other state following the same layout.
+    (c) --use-state-registry: same discovery, but pointed at
+        pipeline_configs/state_registry.yml instead (needs a full entry
+        there -- spatial_block_deg/band stats too, not just the path
+        templates -- so this only applies to states already migrated,
+        e.g. AZ/GA/PA).
+  Reuses model_ckpt_dir/imagery_prefix/find_preds_csv/latest_existing_version
+  from build_cross_quarter_r2_matrix.py / generate_validate_config.py
+  rather than reimplementing that path logic a third time.
 
 Required (train_quarter, eval_quarter) cells, per year -- Q1's full row
 (needed for steps 2-4, all of which transfer FROM Q1), every quarter's own
@@ -80,23 +91,28 @@ Q3->Q1 for the step-5 placebo:
     (1,1) (1,2) (1,3) (1,4)   (2,2)   (3,3) (3,1)   (4,4)
 
 Usage:
-    # Auto-discover preds CSVs via state_registry.yml (state already
-    # migrated there, e.g. once OH is):
+    # Sanity-check which cells are actually found first (no --wealth-csv/
+    # --lc-csv needed yet):
+    python 4_analysis/analyze_transfer_penalty_landcover.py \
+        --state oh --years 2017 2018 2019 --build-manifest-only \
+        --out-dir ./out_transfer_penalty/oh
+
+    # Full run, --ndvi-csv omitted (step 6 just gets skipped):
     python 4_analysis/analyze_transfer_penalty_landcover.py \
         --state oh --years 2017 2018 2019 \
         --wealth-csv ./oh_wi2019.csv --wealth-col wealth_index_overall_core \
         --lc-csv ./lc_oh.csv --out-dir ./out_transfer_penalty/oh
 
-    # Or point directly at already-validated preds CSVs (OH's actual
-    # current setup, predating state_registry.yml):
+    # Or point directly at an explicit manifest instead of auto-discovery:
     python 4_analysis/analyze_transfer_penalty_landcover.py \
         --state oh --years 2017 2018 2019 \
         --wealth-csv ./oh_wi2019.csv --wealth-col wealth_index_overall_core \
         --lc-csv ./lc_oh.csv --preds-manifest ./oh_preds_manifest.csv \
-        --ndvi-csv ./ndvi_oh.csv --out-dir ./out_transfer_penalty/oh
+        --out-dir ./out_transfer_penalty/oh
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -107,14 +123,27 @@ import statsmodels.formula.api as smf
 from scipy import stats as scipy_stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline_configs"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "1_data_prep"))
 from build_cross_quarter_r2_matrix import (  # noqa: E402
     model_ckpt_dir, imagery_prefix, find_preds_csv, load_registry,
 )
+from generate_validate_config import latest_existing_version  # noqa: E402
 from update_ys_labels import normalize_geoid  # noqa: E402
 
 LC_RENAME = {"Tree cover": "tree_cover", "Cropland": "cropland", "Built-up": "built_up"}
 REQUIRED_CELLS = [(1, 1), (1, 2), (1, 3), (1, 4), (2, 2), (3, 3), (4, 4), (3, 1)]
+
+# Same directory/naming convention every state (AZ/GA/PA, and OH's actual
+# on-disk layout too, confirmed against a real `ls` of OH's q2_2017
+# checkpoint) already uses -- see generate_download_config.py/
+# generate_train_config.py's identical templates. Parameterized here
+# directly (not via state_registry.yml's resolve_state_settings) because
+# that function also demands spatial_block_deg/band_mean/band_std/
+# in_channels be filled in, which a pre-registry state like OH doesn't
+# have and doesn't need just to locate already-written preds CSVs.
+DEFAULT_DATA_ROOT_TEMPLATE = "/data/hbaier/new_data/tlag/{state}_imagery/q{quarter}_{year}_s2_allbands/"
+DEFAULT_BASE_PREFIX_TEMPLATE = "{state}_{year}_q{quarter}_s2_allbands"
 
 
 # ---------------------------------------------------------------------
@@ -177,6 +206,45 @@ def build_manifest_from_registry(state, variable, years, version, registry) -> p
             csv_path = find_preds_csv(ckpt_dir, prefix)
             if csv_path is None:
                 missing.append((year, train_q, eval_q, f"not validated under {ckpt_dir}"))
+                continue
+            rows.append({"year": year, "train_quarter": train_q, "eval_quarter": eval_q, "preds_csv": csv_path})
+    if missing:
+        print(f"[Step 1] WARNING: {len(missing)}/{len(years) * len(REQUIRED_CELLS)} required "
+              f"(year, train_q, eval_q) cell(s) not found -- dropped from the analysis:")
+        for year, tq, eq, reason in missing:
+            print(f"    {year} Q{tq}->Q{eq}: {reason}")
+    return pd.DataFrame(rows, columns=["year", "train_quarter", "eval_quarter", "preds_csv"])
+
+
+def _template_ckpt_dir(state, variable, year, quarter, version, data_root_template):
+    data_root = data_root_template.format(state=state, year=year, quarter=quarter)
+    data_root = data_root if data_root.endswith("/") else data_root + "/"
+    output_dir = data_root + "artifacts/"
+    exp_base = f"{state}_q{quarter}_{year}_{variable}"
+    v = version or latest_existing_version(output_dir, exp_base)
+    return os.path.join(output_dir, f"{exp_base}_{v}")
+
+
+def _template_imagery_prefix(state, variable, year, quarter, base_prefix_template):
+    base_prefix = base_prefix_template.format(state=state, year=year, quarter=quarter)
+    return f"{base_prefix}_{variable}"
+
+
+def build_manifest_from_templates(state, variable, years, version,
+                                   data_root_template, base_prefix_template) -> pd.DataFrame:
+    """Same discovery as build_manifest_from_registry, but pointed at
+    --data-root-template/--base-prefix-template directly instead of a
+    state_registry.yml entry -- the path for a state (OH) that isn't in
+    the registry but already writes checkpoints/preds CSVs in the exact
+    same layout as the states that are."""
+    rows, missing = [], []
+    for year in years:
+        for train_q, eval_q in REQUIRED_CELLS:
+            ckpt_dir = _template_ckpt_dir(state, variable, year, train_q, version, data_root_template)
+            prefix = _template_imagery_prefix(state, variable, year, eval_q, base_prefix_template)
+            csv_path = find_preds_csv(ckpt_dir, prefix)
+            if csv_path is None:
+                missing.append((year, train_q, eval_q, f"not found under {ckpt_dir}"))
                 continue
             rows.append({"year": year, "train_quarter": train_q, "eval_quarter": eval_q, "preds_csv": csv_path})
     if missing:
@@ -525,16 +593,34 @@ def main():
     p.add_argument("--state", required=True)
     p.add_argument("--variable", default="wealth_index")
     p.add_argument("--years", required=True, nargs="+", type=int)
-    p.add_argument("--version", default=None, help="Trained version per row (default: latest existing)")
-    p.add_argument("--wealth-csv", required=True)
+    p.add_argument("--version", default=None,
+                    help="Trained version per row, e.g. 'v1' (default: auto-detect the latest "
+                         "existing version under each quarter's artifacts/ dir)")
+    p.add_argument("--wealth-csv", default=None, help="Required unless --build-manifest-only")
     p.add_argument("--wealth-col", default="wealth_index_overall_core")
-    p.add_argument("--lc-csv", required=True)
-    p.add_argument("--ndvi-csv", default=None, help="Optional, enables step 6")
+    p.add_argument("--lc-csv", default=None, help="Required unless --build-manifest-only")
+    p.add_argument("--ndvi-csv", default=None, help="Optional, enables step 6 -- fine to omit entirely")
     p.add_argument("--preds-manifest", default=None,
-                    help="CSV with columns year,train_quarter,eval_quarter,preds_csv. If omitted, "
-                         "built from pipeline_configs/state_registry.yml (requires --state to have "
-                         "a data_root_template/base_prefix_template entry there and the 8 required "
-                         "cross-quarter cells already validated -- see this script's docstring).")
+                    help="CSV with columns year,train_quarter,eval_quarter,preds_csv. If given, "
+                         "used as-is and nothing below in this paragraph applies. Otherwise the "
+                         "manifest is built automatically from --data-root-template/"
+                         "--base-prefix-template (default: every state's existing on-disk "
+                         "convention, OH included -- state_registry.yml not required), or, with "
+                         "--use-state-registry, from pipeline_configs/state_registry.yml instead "
+                         "(needs a full registry entry: spatial_block_deg/band stats too, not just "
+                         "the path templates).")
+    p.add_argument("--use-state-registry", action="store_true",
+                    help="Build the manifest via pipeline_configs/state_registry.yml instead of "
+                         "--data-root-template/--base-prefix-template")
+    p.add_argument("--data-root-template", default=DEFAULT_DATA_ROOT_TEMPLATE,
+                    help=f"Python .format() string with {{state}}/{{year}}/{{quarter}} "
+                         f"(default: {DEFAULT_DATA_ROOT_TEMPLATE!r})")
+    p.add_argument("--base-prefix-template", default=DEFAULT_BASE_PREFIX_TEMPLATE,
+                    help=f"Same idea for dataset.prefix (default: {DEFAULT_BASE_PREFIX_TEMPLATE!r})")
+    p.add_argument("--build-manifest-only", action="store_true",
+                    help="Discover and write preds_manifest.csv, then stop -- skips the regression "
+                         "steps, so --wealth-csv/--lc-csv aren't needed. Useful to sanity-check "
+                         "which cells were found before those are ready.")
     p.add_argument("--urban-built-up-threshold", type=float, default=0.5)
     p.add_argument("--out-dir", default=None, help="Default: ./out_transfer_penalty/<state>")
     args = p.parse_args()
@@ -542,23 +628,37 @@ def main():
     out_dir = Path(args.out_dir or f"./out_transfer_penalty/{args.state.lower()}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    wealth_df = load_wealth(args.wealth_csv, args.wealth_col)
-    lc_df = load_landcover(args.lc_csv)
-    step0_sanity_check(wealth_df, lc_df)
-    features_df = lc_df  # GEOID, tree_cover, cropland, built_up
-
     if args.preds_manifest:
         manifest = load_manifest_csv(args.preds_manifest)
-    else:
+    elif args.use_state_registry:
         registry = load_registry()
         manifest = build_manifest_from_registry(
             args.state.lower(), args.variable, args.years, args.version, registry
+        )
+    else:
+        manifest = build_manifest_from_templates(
+            args.state.lower(), args.variable, args.years, args.version,
+            args.data_root_template, args.base_prefix_template,
         )
     if manifest.empty:
         raise SystemExit("No preds CSVs found/loaded -- nothing to analyze. Run the cross-quarter "
                           "validate configs first (generate_cross_validate_config.py), or pass "
                           "--preds-manifest.")
-    manifest.to_csv(out_dir / "preds_manifest.csv", index=False)
+    manifest_path = out_dir / "preds_manifest.csv"
+    manifest.to_csv(manifest_path, index=False)
+    print(f"Wrote {manifest_path} ({len(manifest)} cell(s))")
+
+    if args.build_manifest_only:
+        print("--build-manifest-only set -- stopping here.")
+        return
+
+    if not args.wealth_csv or not args.lc_csv:
+        raise SystemExit("--wealth-csv and --lc-csv are required unless --build-manifest-only is set.")
+
+    wealth_df = load_wealth(args.wealth_csv, args.wealth_col)
+    lc_df = load_landcover(args.lc_csv)
+    step0_sanity_check(wealth_df, lc_df)
+    features_df = lc_df  # GEOID, tree_cover, cropland, built_up
 
     error_long = build_error_table(manifest)
 
