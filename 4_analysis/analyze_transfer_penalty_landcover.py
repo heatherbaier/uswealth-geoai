@@ -49,6 +49,26 @@ where this fits):
 Ends with one summary CSV of every regression's coefficients and a short
 printed interpretation.
 
+Two methodology points worth being explicit about, both fixed after an
+earlier version of this script's own printed interpretation got them
+wrong on a real Ohio run:
+  - Land-cover fractions are compositional (sum to ~1). Every regression
+    here includes EVERY class present in --lc-csv except one, explicitly
+    chosen as the omitted reference category (resolve_reference_class) --
+    not just tree_cover/cropland/built_up with everything else silently
+    absorbed into the intercept. Three negative coefficients don't mean
+    "less of everything is better"; they mean "more of the OMITTED class
+    is worse", and the reference class is always printed so that's never
+    ambiguous.
+  - The hypothesis is directional: more tree cover should mean a BIGGER
+    transfer penalty (a positive coefficient). A significant coefficient
+    with the WRONG sign is evidence AGAINST the hypothesis, not for it --
+    every printed claim here is gated on sign as well as significance
+    (see _direction_note), and a subsample regression fitting several
+    parameters against too few clusters (e.g. step 4 with under
+    --min-urban-tracts, default 30) is skipped rather than reported as if
+    it were a finding.
+
 Inputs this needs, none of which this script produces:
   --wealth-csv   GEOID + a wealth index column. For OH specifically there
                  is no clean_wealth_index.py output (see REPLICATION.md --
@@ -113,6 +133,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -131,8 +152,26 @@ from build_cross_quarter_r2_matrix import (  # noqa: E402
 from generate_validate_config import latest_existing_version  # noqa: E402
 from update_ys_labels import normalize_geoid  # noqa: E402
 
-LC_RENAME = {"Tree cover": "tree_cover", "Cropland": "cropland", "Built-up": "built_up"}
+NAMED_LC_CLASSES = {"tree_cover": "Tree cover", "cropland": "Cropland", "built_up": "Built-up"}
 REQUIRED_CELLS = [(1, 1), (1, 2), (1, 3), (1, 4), (2, 2), (3, 3), (4, 4), (3, 1)]
+MIN_CLUSTERS_WARNING = 30
+ALPHA = 0.05
+
+
+def _direction_note(coef: float, p: float) -> str:
+    """The hypothesis is directional (more tree cover -> BIGGER transfer
+    penalty, i.e. a POSITIVE coefficient), not just "tree cover matters
+    somehow" -- a significant result with the wrong sign is evidence
+    AGAINST the hypothesis, not for it. Never collapse this to "p<0.05 so
+    it holds"."""
+    if p is None:
+        return "not estimable"
+    if coef > 0 and p < ALPHA:
+        return f"significant and POSITIVE (p={p:.4g}) -- consistent with the hypothesis"
+    if coef < 0 and p < ALPHA:
+        return (f"significant but NEGATIVE (p={p:.4g}) -- OPPOSITE the hypothesis "
+                f"(more of this predictor associated with a SMALLER transfer penalty here)")
+    return f"not significant (p={p:.4g}, coef={coef:+.5f}) -- no support either way"
 
 # Same directory/naming convention every state (AZ/GA/PA, and OH's actual
 # on-disk layout too, confirmed against a real `ls` of OH's q2_2017
@@ -161,7 +200,19 @@ def load_wealth(wealth_csv, wealth_col) -> pd.DataFrame:
     return out.dropna(subset=["GEOID", "wealth_index"]).drop_duplicates(subset="GEOID")
 
 
+def snake_case(name: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z]+", "_", name.strip()).strip("_").lower()
+
+
 def load_landcover(lc_csv) -> pd.DataFrame:
+    """Keeps EVERY class column present, not just tree_cover/cropland/
+    built_up -- land cover fractions are compositional (sum to ~1), so a
+    regression that only includes 3 of N classes leaves the other N-3
+    implicitly folded into the intercept as an unstated reference
+    category. resolve_reference_class() below picks one of the extras
+    (e.g. Grassland) to serve as that reference explicitly, so every
+    printed coefficient can be stated as "relative to <X>" instead of
+    "relative to whatever's left over"."""
     lc = pd.read_csv(lc_csv, dtype={0: str}, index_col=0)
     lc.index.name = "GEOID"
     lc = lc.reset_index()
@@ -172,11 +223,41 @@ def load_landcover(lc_csv) -> pd.DataFrame:
     if (row_sums > 2).any():
         lc[class_cols] = lc[class_cols].div(row_sums, axis=0)
 
-    missing = [c for c in LC_RENAME if c not in lc.columns]
+    lc = lc.rename(columns={c: snake_case(c) for c in class_cols})
+    snake_cols = [snake_case(c) for c in class_cols]
+
+    missing = [snake for snake in NAMED_LC_CLASSES if snake not in snake_cols]
     if missing:
-        raise SystemExit(f"--lc-csv is missing expected class column(s): {missing} (has: {class_cols})")
-    lc = lc.rename(columns=LC_RENAME)
-    return lc[["GEOID", "tree_cover", "cropland", "built_up"]].drop_duplicates(subset="GEOID")
+        have = [NAMED_LC_CLASSES.get(c, c) for c in snake_cols]
+        raise SystemExit(f"--lc-csv is missing expected class column(s) for {missing} (has: {have})")
+
+    return lc[["GEOID"] + snake_cols].drop_duplicates(subset="GEOID")
+
+
+def resolve_reference_class(features_df: pd.DataFrame, reference_class=None) -> str:
+    """Picks (or validates) the omitted reference land-cover category.
+    Every OTHER class present gets included as an explicit regressor --
+    this is the fix for a real bug: with only tree_cover/cropland/built_up
+    in the model, three negative coefficients don't mean "less of
+    everything is better", they mean "more of the OMITTED class (whatever
+    that silently ends up being) is worse". Making it explicit removes
+    that ambiguity."""
+    lc_classes = [c for c in features_df.columns if c != "GEOID"]
+    if reference_class is not None:
+        if reference_class not in lc_classes:
+            raise SystemExit(f"--lc-reference-class {reference_class!r} not among land-cover "
+                              f"columns: {lc_classes}")
+        return reference_class
+    non_named = [c for c in lc_classes if c not in NAMED_LC_CLASSES]
+    if not non_named:
+        raise SystemExit(
+            "No land-cover class left over to serve as an omitted reference category -- --lc-csv "
+            "only has tree_cover/cropland/built_up. Add more ESA WorldCover classes (e.g. "
+            "Grassland, Shrubland) to lc.csv, or pass --lc-reference-class explicitly (it will "
+            "then be dropped as a regressor, same as any reference category)."
+        )
+    # Default: the largest-mean leftover class -- the most natural "everything else" baseline.
+    return features_df[non_named].mean().idxmax()
 
 
 def step0_sanity_check(wealth_df: pd.DataFrame, lc_df: pd.DataFrame):
@@ -324,14 +405,25 @@ def transfer_penalty(error_long: pd.DataFrame, train_q: int, eval_q: int) -> pd.
 # Regression core, reused by steps 2-6
 # ---------------------------------------------------------------------
 def run_penalty_regression(penalty_df: pd.DataFrame, features_df: pd.DataFrame,
-                            primary_col: str, label: str,
-                            controls=("cropland", "built_up"),
-                            min_std=1e-8, print_summary=True, full_summary=False):
-    """penalty ~ primary_col + controls + C(year), SEs clustered by GEOID
-    (tracts repeat across years, so residuals within a tract across years
-    aren't independent -- plain OLS SEs would be too small)."""
+                            primary_col: str, label: str, reference_class: str,
+                            min_std=1e-8, min_clusters=MIN_CLUSTERS_WARNING,
+                            print_summary=True, full_summary=False):
+    """penalty ~ primary_col + (every land-cover class in features_df
+    except primary_col and reference_class) + C(year), SEs clustered by
+    GEOID (tracts repeat across years, so residuals within a tract across
+    years aren't independent -- plain OLS SEs would be too small).
+
+    Controls are EVERY other land-cover class present, not a hardcoded
+    pair -- reference_class is the one deliberately left out (see
+    resolve_reference_class), so every coefficient here is interpretable
+    as "relative to a tract that's entirely reference_class", stated
+    explicitly rather than left as an implicit intercept effect.
+    """
+    lc_classes = [c for c in features_df.columns if c != "GEOID"]
+    controls = [c for c in lc_classes if c not in (primary_col, reference_class)]
+
     d = penalty_df.merge(features_df, on="GEOID", how="inner")
-    needed = [primary_col] + [c for c in controls if c != primary_col]
+    needed = [primary_col] + controls
     d = d.dropna(subset=["penalty", "year", *needed])
 
     if d[primary_col].std() < min_std:
@@ -341,15 +433,15 @@ def run_penalty_regression(penalty_df: pd.DataFrame, features_df: pd.DataFrame,
     terms = [primary_col]
     dropped = []
     for c in controls:
-        if c == primary_col:
-            continue
         if d[c].std() < min_std:
             dropped.append(c)
             continue
         terms.append(c)
 
+    n_clusters = d["GEOID"].nunique()
     formula = f"penalty ~ {' + '.join(terms)} + C(year)"
     model = smf.ols(formula, data=d).fit(cov_type="cluster", cov_kwds={"groups": d["GEOID"]})
+    n_params = len(model.params)
 
     # Standardized coefficient = coef * std(x) / std(y): puts predictors
     # on different natural scales (a land-cover fraction in [0,1] vs. an
@@ -362,15 +454,22 @@ def run_penalty_regression(penalty_df: pd.DataFrame, features_df: pd.DataFrame,
             standardized[c] = raw * d[c].std() / y_std
 
     result = {
-        "label": label, "n": len(d), "n_tracts": d["GEOID"].nunique(),
+        "label": label, "n": len(d), "n_tracts": d["GEOID"].nunique(), "n_clusters": n_clusters,
+        "n_params": n_params, "reference_class": reference_class,
         "model": model, "formula": formula, "terms": terms,
         "standardized": standardized, "dropped_controls": dropped,
     }
 
     if print_summary:
-        print(f"\n[{label}] {formula}  (n={result['n']}, n_tracts={result['n_tracts']})")
+        print(f"\n[{label}] {formula}  (n={result['n']}, n_tracts={result['n_tracts']}, "
+              f"reference={reference_class!r})")
         if dropped:
             print(f"  (dropped near-constant control(s) in this subsample: {dropped})")
+        if n_clusters < min_clusters:
+            print(f"  WARNING: only {n_clusters} tract(s)/cluster(s) fitting {n_params} parameters "
+                  f"-- cluster-robust SEs need substantially more clusters than that to be "
+                  f"trustworthy (rule of thumb: >= {min_clusters}). Treat this result as "
+                  f"illustrative, not a finding.")
         for c in terms:
             coef, se, pval = model.params[c], model.bse[c], model.pvalues[c]
             std_b = standardized.get(c)
@@ -386,13 +485,19 @@ def run_penalty_regression(penalty_df: pd.DataFrame, features_df: pd.DataFrame,
 # ---------------------------------------------------------------------
 # Step 2 -- main regression
 # ---------------------------------------------------------------------
-def step2_main_regression(pen_13: pd.DataFrame, features_df: pd.DataFrame):
-    res = run_penalty_regression(pen_13, features_df, "tree_cover", "Q1->Q3 (main)", full_summary=True)
+def step2_main_regression(pen_13: pd.DataFrame, features_df: pd.DataFrame, reference_class: str):
+    res = run_penalty_regression(pen_13, features_df, "tree_cover", "Q1->Q3 (main)",
+                                  reference_class, full_summary=True)
+    tree_coef = res["model"].params.get("tree_cover")
+    tree_p = res["model"].pvalues.get("tree_cover")
     tree_std = res["standardized"].get("tree_cover")
     crop_std = res["standardized"].get("cropland")
+    if tree_coef is not None and tree_p is not None:
+        print(f"\n[Step 2] Tree cover: {_direction_note(tree_coef, tree_p)}")
     if tree_std is not None and crop_std is not None:
         bigger = "tree cover" if abs(tree_std) > abs(crop_std) else "cropland"
-        print(f"\n[Step 2] Larger standardized coefficient: {bigger} "
+        print(f"[Step 2] Larger standardized MAGNITUDE (not necessarily more supportive of the "
+              f"hypothesis -- check the direction note above): {bigger} "
               f"(tree cover={tree_std:+.4f} SD, cropland={crop_std:+.4f} SD)")
     return res
 
@@ -401,7 +506,7 @@ def step2_main_regression(pen_13: pd.DataFrame, features_df: pd.DataFrame):
 # Step 3 -- dose-response
 # ---------------------------------------------------------------------
 def step3_dose_response(error_long: pd.DataFrame, features_df: pd.DataFrame, out_dir: Path,
-                         precomputed=None):
+                         reference_class: str, precomputed=None):
     precomputed = precomputed or {}
     pairs = [(1, 2), (1, 3), (1, 4)]
     results, rows = {}, []
@@ -409,13 +514,15 @@ def step3_dose_response(error_long: pd.DataFrame, features_df: pd.DataFrame, out
         res = precomputed.get((train_q, eval_q))
         if res is None:
             pen = transfer_penalty(error_long, train_q, eval_q)
-            res = run_penalty_regression(pen, features_df, "tree_cover", f"Q{train_q}->Q{eval_q}")
+            res = run_penalty_regression(pen, features_df, "tree_cover", f"Q{train_q}->Q{eval_q}",
+                                          reference_class)
         results[(train_q, eval_q)] = res
         ci = res["model"].conf_int().loc["tree_cover"]
         rows.append({
             "transfer": f"Q{train_q}->Q{eval_q}", "distance_quarters": eval_q - train_q,
             "coef": res["model"].params["tree_cover"], "se": res["model"].bse["tree_cover"],
             "ci_lower": ci[0], "ci_upper": ci[1], "n": res["n"],
+            "significant": bool(ci[0] > 0 or ci[1] < 0),
         })
     dose_df = pd.DataFrame(rows).sort_values("distance_quarters").reset_index(drop=True)
 
@@ -444,40 +551,49 @@ def step3_dose_response(error_long: pd.DataFrame, features_df: pd.DataFrame, out
 # ---------------------------------------------------------------------
 # Step 4 -- urban restriction
 # ---------------------------------------------------------------------
-def step4_urban_restriction(error_long: pd.DataFrame, features_df: pd.DataFrame, built_up_threshold: float):
+def step4_urban_restriction(error_long: pd.DataFrame, features_df: pd.DataFrame,
+                             built_up_threshold: float, reference_class: str,
+                             min_urban_tracts=MIN_CLUSTERS_WARNING):
     urban_geoids = features_df.loc[features_df["built_up"] > built_up_threshold, "GEOID"]
     pen = transfer_penalty(error_long, 1, 3)
     pen_urban = pen[pen["GEOID"].isin(urban_geoids)]
     n_urban_tracts = pen_urban["GEOID"].nunique()
     print(f"\n[Step 4] Urban restriction (built_up > {built_up_threshold}): "
           f"{n_urban_tracts} / {pen['GEOID'].nunique()} tracts")
-    if n_urban_tracts < 10:
-        print("  Too few urban tracts for a reliable regression -- skipping.")
+    if n_urban_tracts < min_urban_tracts:
+        print(f"  Only {n_urban_tracts} urban tract(s) -- below --min-urban-tracts="
+              f"{min_urban_tracts}. A clustered regression here would fit several parameters "
+              f"against that many clusters (or fewer, after tracts repeat across years get "
+              f"counted once); the result would be overfitting noise dressed up as a coefficient, "
+              f"not a finding. Skipping. Pass --min-urban-tracts to override if you want to see it "
+              f"anyway (with that caveat).")
         return None
-    res = run_penalty_regression(pen_urban, features_df, "tree_cover", "Q1->Q3 (urban-restricted)")
+    res = run_penalty_regression(pen_urban, features_df, "tree_cover", "Q1->Q3 (urban-restricted)",
+                                  reference_class)
+    coef = res["model"].params.get("tree_cover")
     p = res["model"].pvalues.get("tree_cover")
-    if p is None:
-        print("[Step 4] tree cover not estimable in this subsample")
-    else:
-        survives = p < 0.05
-        print(f"[Step 4] Tree cover coefficient {'SURVIVES' if survives else 'DOES NOT survive'} "
-              f"urban restriction (p={p:.4g})")
+    print(f"[Step 4] Tree cover: {_direction_note(coef, p)}")
     return res
 
 
 # ---------------------------------------------------------------------
 # Step 5 -- reverse-direction placebo
 # ---------------------------------------------------------------------
-def step5_placebo(error_long: pd.DataFrame, features_df: pd.DataFrame):
+def step5_placebo(error_long: pd.DataFrame, features_df: pd.DataFrame, reference_class: str):
     pen = transfer_penalty(error_long, 3, 1)
-    res = run_penalty_regression(pen, features_df, "tree_cover", "Q3->Q1 (placebo)")
+    res = run_penalty_regression(pen, features_df, "tree_cover", "Q3->Q1 (placebo)", reference_class)
+    coef = res["model"].params.get("tree_cover")
     p = res["model"].pvalues.get("tree_cover")
     if p is None:
         print("[Step 5] tree cover not estimable")
     else:
-        is_null = p >= 0.05
-        print(f"[Step 5] Placebo {'PASSES' if is_null else 'FAILS'} "
-              f"(tree cover {'is not' if is_null else 'IS'} significant in the reverse direction, p={p:.4g})")
+        # Unlike steps 2/4, a placebo pass is sign-agnostic: significance
+        # in EITHER direction here is bad news for the hypothesis (it
+        # would mean tree cover predicts transfer failure even where the
+        # hypothesis says it shouldn't), so this checks p alone on purpose.
+        is_null = p >= ALPHA
+        print(f"[Step 5] Placebo {'PASSES' if is_null else 'FAILS'} (tree cover coef={coef:+.5f}, "
+              f"{'not' if is_null else 'IS'} significant in the reverse direction, p={p:.4g})")
     return res
 
 
@@ -502,7 +618,7 @@ def load_ndvi_amplitude(ndvi_csv) -> pd.DataFrame:
     return (q3 - q1).rename("amplitude").reset_index()
 
 
-def step6_ndvi_alternative(pen_13: pd.DataFrame, features_df: pd.DataFrame, ndvi_csv):
+def step6_ndvi_alternative(pen_13: pd.DataFrame, features_df: pd.DataFrame, ndvi_csv, reference_class: str):
     if ndvi_csv is None:
         print("\n[Step 6] --ndvi-csv not provided -- skipping NDVI-amplitude alternative.")
         return None
@@ -511,7 +627,12 @@ def step6_ndvi_alternative(pen_13: pd.DataFrame, features_df: pd.DataFrame, ndvi
     n_missing = features_with_amp["amplitude"].isna().sum()
     if n_missing:
         print(f"[Step 6] {n_missing} tract(s) missing NDVI amplitude, dropped from this regression")
-    return run_penalty_regression(pen_13, features_with_amp, "amplitude", "Q1->Q3 (NDVI amplitude)")
+    res = run_penalty_regression(pen_13, features_with_amp, "amplitude", "Q1->Q3 (NDVI amplitude)",
+                                  reference_class)
+    coef = res["model"].params.get("amplitude")
+    p = res["model"].pvalues.get("amplitude")
+    print(f"[Step 6] Amplitude: {_direction_note(coef, p)}")
+    return res
 
 
 # ---------------------------------------------------------------------
@@ -528,7 +649,10 @@ def summarize(results, out_dir: Path) -> pd.DataFrame:
                 "regression": res["label"], "term": term,
                 "coef": m.params[term], "se": m.bse[term], "p": m.pvalues[term],
                 "standardized": res["standardized"].get(term),
-                "n": res["n"], "n_tracts": res["n_tracts"], "r2": m.rsquared,
+                "n": res["n"], "n_tracts": res["n_tracts"], "n_clusters": res["n_clusters"],
+                "n_params": res["n_params"], "reference_class": res["reference_class"],
+                "low_cluster_count": res["n_clusters"] < MIN_CLUSTERS_WARNING,
+                "r2": m.rsquared,
             })
     summary = pd.DataFrame(rows)
     out_path = out_dir / "summary_table.csv"
@@ -539,49 +663,86 @@ def summarize(results, out_dir: Path) -> pd.DataFrame:
 
 
 def print_interpretation(main_res, dose_df, urban_res, placebo_res, ndvi_res):
+    """Every claim here is gated on BOTH significance AND sign matching
+    the hypothesis (more of the predictor -> bigger transfer penalty) --
+    "significant" alone is not "supports the hypothesis": a significant
+    coefficient with the wrong sign is evidence AGAINST it. See
+    _direction_note(). Also never calls a pattern a "gradient" without
+    checking the CIs actually exclude zero and the pattern holds in
+    |magnitude|, not just in signed value (a sequence that crosses zero
+    can be "monotonic" in raw value while its true effect size is
+    shrinking -- see step 3's own construction)."""
     print("\n" + "=" * 70)
     print("INTERPRETATION")
     print("=" * 70)
     lines = []
 
+    tree_coef = main_res["model"].params.get("tree_cover")
+    tree_p = main_res["model"].pvalues.get("tree_cover")
     tree_std = main_res["standardized"].get("tree_cover")
     crop_std = main_res["standardized"].get("cropland")
+    if tree_coef is not None and tree_p is not None:
+        lines.append(f"Main regression (Q1->Q3): tree cover is {_direction_note(tree_coef, tree_p)} "
+                     f"(reference category: {main_res['reference_class']}).")
     if tree_std is not None and crop_std is not None:
-        bigger = "Tree cover" if abs(tree_std) > abs(crop_std) else "Cropland"
-        lines.append(f"{bigger} carries the larger standardized effect on the Q1->Q3 transfer "
-                     f"penalty (tree cover={tree_std:+.3f} SD, cropland={crop_std:+.3f} SD).")
+        bigger = "tree cover" if abs(tree_std) > abs(crop_std) else "cropland"
+        lines.append(f"By raw standardized MAGNITUDE (not the same as support for the hypothesis -- "
+                     f"see the line above), {bigger} is larger (tree cover={tree_std:+.3f} SD, "
+                     f"cropland={crop_std:+.3f} SD).")
 
     if dose_df is not None and len(dose_df) == 3:
-        coefs = dose_df.sort_values("distance_quarters")["coef"].tolist()
-        monotonic = all(a <= b for a, b in zip(coefs, coefs[1:])) or all(a >= b for a, b in zip(coefs, coefs[1:]))
-        desc = ", ".join(f"{r.transfer}={r.coef:+.4f}" for r in dose_df.itertuples())
-        lines.append(f"The tree cover coefficient {'IS' if monotonic else 'is NOT'} monotonic with "
-                     f"seasonal distance from Q1 ({desc}).")
+        rows = list(dose_df.sort_values("distance_quarters").itertuples())
+        coefs = [r.coef for r in rows]
+        sig = [bool(r.significant) for r in rows]
+        desc = ", ".join(f"{r.transfer}={r.coef:+.4f}{'*' if s else ''}"
+                          for r, s in zip(rows, sig))
+        if not any(sig):
+            lines.append(f"Dose-response ({desc}, * = CI excludes 0): NONE of the three distances "
+                         f"have a CI excluding zero -- there is no reliable dose-response signal "
+                         f"here, regardless of how the raw point estimates are ordered.")
+        else:
+            mags = [abs(c) for c in coefs]
+            mag_increasing = all(a <= b for a, b in zip(mags, mags[1:]))
+            same_sign = len({c > 0 for c in coefs}) == 1
+            if mag_increasing and same_sign and coefs[0] > 0:
+                lines.append(f"Dose-response ({desc}): |effect| grows with distance and stays "
+                             f"positive throughout -- consistent with a real, hypothesis-direction "
+                             f"gradient.")
+            else:
+                lines.append(f"Dose-response ({desc}): raw values are NOT a clean magnitude "
+                             f"gradient in the hypothesized direction (|coef| by distance: "
+                             f"{', '.join(f'{m:.4f}' for m in mags)}"
+                             f"{'; crosses sign' if not same_sign else ''}) -- do not read this as "
+                             f"support for the canopy hypothesis just because the raw values happen "
+                             f"to be ordered.")
 
     if urban_res is not None:
+        coef = urban_res["model"].params.get("tree_cover")
         p = urban_res["model"].pvalues.get("tree_cover")
-        if p is not None:
-            holds = p < 0.05
-            lines.append(f"Restricted to built_up>0.5 tracts (cropland near-zero there), the tree "
-                         f"cover coefficient {'still holds' if holds else 'does not hold'} (p={p:.4g}) -- "
-                         f"{'supporting' if holds else 'undermining'} residential canopy over "
-                         f"agricultural land as the mechanism.")
+        if coef is not None and p is not None:
+            caveat = (f" CAVEAT: only {urban_res['n_clusters']} tract(s)/cluster(s) fitting "
+                      f"{urban_res['n_params']} parameters -- treat as illustrative, not a finding."
+                      if urban_res["n_clusters"] < MIN_CLUSTERS_WARNING else "")
+            lines.append(f"Urban restriction: tree cover is {_direction_note(coef, p)}.{caveat}")
+    else:
+        lines.append("Urban restriction: skipped (too few urban tracts for a trustworthy "
+                     "clustered regression -- see Step 4's own message for the count).")
 
     if placebo_res is not None:
+        coef = placebo_res["model"].params.get("tree_cover")
         p = placebo_res["model"].pvalues.get("tree_cover")
         if p is not None:
-            is_null = p >= 0.05
-            lines.append(f"The Q3->Q1 placebo {'is null as predicted' if is_null else 'is NOT null'} "
-                         f"(p={p:.4g}), {'strengthening' if is_null else 'weakening'} the directional "
+            is_null = p >= ALPHA
+            lines.append(f"The Q3->Q1 placebo (coef={coef:+.5f}, p={p:.4g}) "
+                         f"{'is null as predicted' if is_null else 'is NOT null'}, "
+                         f"{'strengthening' if is_null else 'weakening'} the directional "
                          f"(growing-season-model-handles-bare-landscapes) story.")
 
     if ndvi_res is not None:
         amp_coef = ndvi_res["model"].params.get("amplitude")
-        tree_coef = main_res["model"].params.get("tree_cover")
-        if amp_coef is not None and tree_coef is not None:
-            sign_match = (amp_coef * tree_coef) > 0
-            lines.append(f"The NDVI-amplitude alternative {'agrees' if sign_match else 'disagrees'} in sign "
-                         f"with the tree cover result (amplitude coef={amp_coef:+.5f}).")
+        amp_p = ndvi_res["model"].pvalues.get("amplitude")
+        if amp_coef is not None and amp_p is not None:
+            lines.append(f"NDVI-amplitude alternative: {_direction_note(amp_coef, amp_p)}.")
 
     for line in lines:
         print("- " + line)
@@ -622,6 +783,16 @@ def main():
                          "steps, so --wealth-csv/--lc-csv aren't needed. Useful to sanity-check "
                          "which cells were found before those are ready.")
     p.add_argument("--urban-built-up-threshold", type=float, default=0.5)
+    p.add_argument("--min-urban-tracts", type=int, default=MIN_CLUSTERS_WARNING,
+                    help=f"Skip step 4 (urban restriction) if fewer than this many urban tracts "
+                         f"are present -- a clustered regression needs substantially more clusters "
+                         f"than parameters to be trustworthy (default: {MIN_CLUSTERS_WARNING}).")
+    p.add_argument("--lc-reference-class", default=None,
+                    help="Land-cover fractions are compositional (sum to ~1), so every regression "
+                         "needs one class explicitly omitted as the reference category -- every "
+                         "other class present in --lc-csv is included as a control. Default: "
+                         "auto-picks the largest-mean class among whatever's left over after "
+                         "tree_cover/cropland/built_up (e.g. Grassland, if present).")
     p.add_argument("--out-dir", default=None, help="Default: ./out_transfer_penalty/<state>")
     args = p.parse_args()
 
@@ -658,18 +829,26 @@ def main():
     wealth_df = load_wealth(args.wealth_csv, args.wealth_col)
     lc_df = load_landcover(args.lc_csv)
     step0_sanity_check(wealth_df, lc_df)
-    features_df = lc_df  # GEOID, tree_cover, cropland, built_up
+    features_df = lc_df  # GEOID + every land-cover class present
+
+    reference_class = resolve_reference_class(features_df, args.lc_reference_class)
+    all_classes = [c for c in features_df.columns if c != "GEOID"]
+    print(f"\n[Land cover] {len(all_classes)} class(es) present: {all_classes}")
+    print(f"[Land cover] Reference category (omitted from every regression's right-hand side): "
+          f"{reference_class!r} -- every land-cover coefficient below is relative to a tract "
+          f"that's entirely {reference_class}.")
 
     error_long = build_error_table(manifest)
 
     pen_13 = transfer_penalty(error_long, 1, 3)
-    main_res = step2_main_regression(pen_13, features_df)
+    main_res = step2_main_regression(pen_13, features_df, reference_class)
     dose_df, dose_results = step3_dose_response(
-        error_long, features_df, out_dir, precomputed={(1, 3): main_res}
+        error_long, features_df, out_dir, reference_class, precomputed={(1, 3): main_res}
     )
-    urban_res = step4_urban_restriction(error_long, features_df, args.urban_built_up_threshold)
-    placebo_res = step5_placebo(error_long, features_df)
-    ndvi_res = step6_ndvi_alternative(pen_13, features_df, args.ndvi_csv)
+    urban_res = step4_urban_restriction(error_long, features_df, args.urban_built_up_threshold,
+                                         reference_class, args.min_urban_tracts)
+    placebo_res = step5_placebo(error_long, features_df, reference_class)
+    ndvi_res = step6_ndvi_alternative(pen_13, features_df, args.ndvi_csv, reference_class)
 
     all_results = [dose_results[(1, 2)], dose_results[(1, 3)], dose_results[(1, 4)],
                    urban_res, placebo_res, ndvi_res]
