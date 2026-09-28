@@ -60,14 +60,26 @@ ga:
 
 ca:
   # Nothing computed yet, on the old registries or here.
-  shp_path: null
-  label_column: null
-  data_root_template: null
-  base_prefix_template: null
+  shp_path: /home/hbaier/projects/tlags_v2/data/tracts2019/CA/tl_2019_06_tract_wi.shp
+  label_column: wealth_ind
+  data_root_template: "/data/hbaier/new_data/tlag/ca_imagery/q{quarter}_{year}_s2_allbands/"
+  base_prefix_template: "ca_{year}_q{quarter}_s2_allbands"
   in_channels: 12
-  spatial_block_deg: null
-  band_mean: null
-  band_std: null
+  spatial_block_deg: 0.10
+  band_mean: [0.057035, 0.062473, 0.090575, 0.100381, 0.132879, 0.198818, 0.221745, 0.232858, 0.239159, 0.245485, 0.208345, 0.154753]
+  band_std:  [0.060016, 0.065505, 0.072016, 0.08896, 0.084982, 0.080579, 0.087243, 0.094438, 0.091399, 0.094467, 0.111011, 0.106598]
+
+
+oh:
+  # Nothing computed yet, on the old registries or here.
+  shp_path: /home/hbaier/projects/tlags_v2/data/tracts2019/OH/tl_2019_39_tract_wi.shp
+  label_column: wealth_ind
+  data_root_template: "/data/hbaier/new_data/tlag/oh_imagery/q{quarter}_{year}_s2_allbands/"
+  base_prefix_template: "oh_{year}_q{quarter}_s2_allbands"
+  in_channels: 12
+  spatial_block_deg: 0.10
+  band_mean: [0.140787, 0.138161, 0.158773, 0.153679, 0.183618, 0.25247, 0.277614, 0.291284, 0.293952, 0.303836, 0.171341, 0.116057]
+  band_std:  [0.217805, 0.216685, 0.218131, 0.226846, 0.221703, 0.215518, 0.216676, 0.229916, 0.216757, 0.226468, 0.115547, 0.09303]
 
 pa:
   # Follows AZ's exact established convention (fips 42): tl_2019_42_tract_wi.shp,
