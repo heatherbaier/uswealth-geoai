@@ -26,6 +26,20 @@ Usage:
         --state az --variable wealth_index_sat \
         --quarters 2016Q1 2016Q2 2016Q3 2016Q4 \
         --out-dir ./out_cross_quarter/az_wealth_index_sat
+
+    # Also bootstrap each cell's R^2 (1000 resamples of that cell's own
+    # preds CSV, with replacement) to put a CI around it -- useful here
+    # specifically because a cross-quarter cell's held-out set size varies
+    # a lot cell to cell (it's always the MODEL's own test set, but
+    # different imagery quarters can have different numbers of chips
+    # actually present -- see generate_cross_validate_config.py), so two
+    # cells' point-estimate R^2 aren't automatically comparable without
+    # some sense of how much sampling noise each one carries:
+    python 4_analysis/build_cross_quarter_r2_matrix.py \
+        --state az --variable wealth_index_sat \
+        --quarters 2016Q1 2016Q2 2016Q3 2016Q4 \
+        --out-dir ./out_cross_quarter/az_wealth_index_sat \
+        --bootstrap-iters 1000
 """
 
 import argparse
@@ -78,11 +92,51 @@ def find_preds_csv(ckpt_dir: str, prefix: str):
     return matches[-1]
 
 
-def build_matrix(state, variable, quarters, version, registry):
+def bootstrap_r2(labels: np.ndarray, preds: np.ndarray, n_iters: int, ci: float, seed: int):
+    """Non-parametric bootstrap CI for one cell's R^2.
+
+    There's only one held-out set per cell, so there's no natural repeated
+    trial to get a spread from -- this resamples (label, pred) ROW PAIRS
+    together, with replacement, n_iters times and re-scores each resample,
+    giving the sampling-noise band you'd otherwise have no way to put on a
+    single point-estimate R^2. Standard percentile-bootstrap CI (no
+    normality assumption on the R^2 statistic, which isn't symmetric).
+    """
+    rng = np.random.default_rng(seed)
+    n = len(labels)
+    scores = np.full(n_iters, np.nan)
+    for b in range(n_iters):
+        idx = rng.integers(0, n, size=n)
+        y_true, y_pred = labels[idx], preds[idx]
+        if np.ptp(y_true) == 0:
+            # Every resampled label identical -> zero total variance to
+            # explain -> R^2 undefined. Only realistic for a very small
+            # held-out set; skip this draw rather than let sklearn's
+            # edge-case return value quietly skew the distribution.
+            continue
+        scores[b] = r2_score(y_true, y_pred)
+
+    valid = scores[~np.isnan(scores)]
+    if valid.size == 0:
+        return None
+    alpha = (1 - ci) / 2
+    lo, hi = np.percentile(valid, [100 * alpha, 100 * (1 - alpha)])
+    return {
+        "r2_boot_mean": float(valid.mean()),
+        "r2_boot_std": float(valid.std(ddof=1)) if valid.size > 1 else 0.0,
+        "ci_lower": float(lo),
+        "ci_upper": float(hi),
+        "n_boot": int(valid.size),
+    }
+
+
+def build_matrix(state, variable, quarters, version, registry,
+                  bootstrap_iters=0, ci=0.95, seed=1337):
     labels = [f"Q{q} {y}" for y, q in quarters]
     n = len(quarters)
     r2 = pd.DataFrame(np.nan, index=labels, columns=labels)
     n_pairs = pd.DataFrame(0, index=labels, columns=labels, dtype=int)
+    bootstrap_rows = []
 
     for i, (model_year, model_quarter) in enumerate(quarters):
         try:
@@ -99,13 +153,31 @@ def build_matrix(state, variable, quarters, version, registry):
                       f"expected epoch*_valset_{prefix}_preds.csv under {ckpt_dir}")
                 continue
             df = pd.read_csv(csv_path)
-            score = r2_score(df["label"], df["pred"])
+            y_true = df["label"].to_numpy()
+            y_pred = df["pred"].to_numpy()
+            score = r2_score(y_true, y_pred)
             r2.iloc[i, j] = score
             n_pairs.iloc[i, j] = len(df)
             marker = " (diagonal)" if i == j else ""
-            print(f"[{labels[i]} model on {labels[j]} imagery]{marker} r2={score:.4f} n={len(df)}")
 
-    return r2, n_pairs
+            boot_msg = ""
+            if bootstrap_iters > 0:
+                boot = bootstrap_r2(y_true, y_pred, bootstrap_iters, ci, seed)
+                if boot is None:
+                    print(f"  WARNING: every bootstrap resample for {labels[i]} model on "
+                          f"{labels[j]} imagery had zero label variance -- skipping CI for this cell")
+                else:
+                    bootstrap_rows.append({
+                        "model_quarter": labels[i], "imagery_quarter": labels[j],
+                        "r2": score, "n": len(df), **boot,
+                    })
+                    boot_msg = (f"  {int(ci * 100)}% CI=[{boot['ci_lower']:.4f}, "
+                                f"{boot['ci_upper']:.4f}] (n_boot={boot['n_boot']})")
+
+            print(f"[{labels[i]} model on {labels[j]} imagery]{marker} r2={score:.4f} n={len(df)}{boot_msg}")
+
+    bootstrap_df = pd.DataFrame(bootstrap_rows)
+    return r2, n_pairs, bootstrap_df
 
 
 def plot_matrix(r2: pd.DataFrame, state: str, variable: str, out_path: str):
@@ -165,18 +237,34 @@ def main():
     p.add_argument("--version", default=None,
                     help="Trained version to use for every row's model (default: latest existing, per row)")
     p.add_argument("--out-dir", default=None, help="Default: ./out_cross_quarter/<state>_<variable>")
+    p.add_argument("--bootstrap-iters", type=int, default=0,
+                    help="Bootstrap resamples per cell for a CI around that cell's R^2 "
+                         "(default 0: skip bootstrapping entirely). Each cell's own preds "
+                         "CSV is resampled independently, after it's already been read for "
+                         "the point estimate -- no extra inference, no re-running the model.")
+    p.add_argument("--ci", type=float, default=0.95, help="Bootstrap CI width (default 0.95)")
+    p.add_argument("--seed", type=int, default=1337, help="Bootstrap RNG seed")
     args = p.parse_args()
 
     quarters = [parse_imagery_quarter(t) for t in args.quarters]
     registry = load_registry()
 
-    r2, n_pairs = build_matrix(args.state, args.variable, quarters, args.version, registry)
+    r2, n_pairs, bootstrap_df = build_matrix(
+        args.state, args.variable, quarters, args.version, registry,
+        bootstrap_iters=args.bootstrap_iters, ci=args.ci, seed=args.seed,
+    )
 
     out_dir = Path(args.out_dir or f"./out_cross_quarter/{args.state.lower()}_{args.variable}")
     out_dir.mkdir(parents=True, exist_ok=True)
     r2.to_csv(out_dir / "r2_matrix.csv")
     n_pairs.to_csv(out_dir / "n_matrix.csv")
     print(f"Wrote {out_dir / 'r2_matrix.csv'} and {out_dir / 'n_matrix.csv'}")
+
+    if args.bootstrap_iters > 0:
+        boot_path = out_dir / "r2_bootstrap.csv"
+        bootstrap_df.to_csv(boot_path, index=False)
+        print(f"Wrote {boot_path} ({len(bootstrap_df)} cell(s), {args.bootstrap_iters} "
+              f"iters/cell, {int(args.ci * 100)}% CI)")
 
     plot_matrix(r2, args.state, args.variable, str(out_dir / "r2_matrix.png"))
 
