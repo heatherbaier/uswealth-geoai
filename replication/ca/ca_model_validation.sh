@@ -49,3 +49,4 @@ simba /home/hbaier/projects/tlags_v2/configs/sail/tlags/ca/ca_2019_q2_wealth_ind
 simba /home/hbaier/projects/tlags_v2/configs/sail/tlags/ca/ca_2019_q3_wealth_index_validate.yml
 simba /home/hbaier/projects/tlags_v2/configs/sail/tlags/ca/ca_2019_q4_wealth_index_validate.yml
 
+python3 3_validation/validate.py --state CA --imagery-root /data/hbaier/new_data/tlag/ca_imagery/

@@ -2,11 +2,10 @@ archive
 data
 out
 wc
-*csv
+*.csv
 *.ipynb_checkpoints*
 __pycache__/
 1_data_prep/test_lc/
-
 # sail train/validate configs are fully reconstructible from
 # pipeline_configs/state_registry.yml + generate_train_config.py /
 # generate_validate_config.py -- not worth versioning each run (matches
@@ -18,3 +17,7 @@ __pycache__/
 configs/sail/
 configs/**/*.sh
 *slurm*
+slurm_files
+
+
+wc_tiles/
