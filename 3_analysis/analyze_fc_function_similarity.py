@@ -42,16 +42,35 @@ for those in this project), and is substantially more expensive per
 probe (a real backbone forward pass vs. a matrix lookup) -- consider a
 smaller --n-probes (e.g. 200-500) unless running on a GPU node.
 
-For whether any apparent season clustering is more than chance, this
-runs a permutation test directly on the pairwise CKA matrix (Mantel-test
-style): the observed (mean within-quarter CKA) - (mean between-quarter
-CKA) gap, against a null built by reshuffling quarter labels across the
-SAME similarity matrix many times.
+For whether any apparent clustering is more than chance, this runs a
+permutation test directly on the pairwise CKA matrix (Mantel-test style):
+the observed (mean within-group CKA) - (mean between-group CKA) gap,
+against a null built by reshuffling group labels across the SAME
+similarity matrix many times. --group-by {quarter,year} (default quarter)
+picks which column defines the groups -- e.g. a state with a visually
+spread-out CKA heatmap but a null "by quarter" result may still have a
+real difference that's just organized by YEAR instead of season; rerun
+with --group-by year to check that directly.
+
+--cka-matrix/--meta: skip checkpoint discovery and the (expensive,
+especially with --probe-source real) activation-collection step entirely
+and rerun the significance test + plots directly against a previously
+saved cka_matrix.csv + fc_function_meta.csv from an earlier run in the
+same --out-dir. Both must be given together. This is the cheap way to
+re-check a result under a different --group-by without recomputing
+anything.
 
 Usage:
     python 3_analysis/analyze_fc_function_similarity.py \
         --states az ga oh pa --years 2016 2017 2018 2019 --quarters 1 2 3 4 \
         --variable wealth_index --out-dir ./out_fc_function_similarity
+
+    # re-check an existing result grouped by year instead of quarter,
+    # without rerunning probe extraction:
+    python 3_analysis/analyze_fc_function_similarity.py \
+        --cka-matrix ./out_fc_function_similarity/cka_matrix.csv \
+        --meta ./out_fc_function_similarity/fc_function_meta.csv \
+        --group-by year --out-dir ./out_fc_function_similarity
 """
 
 import argparse
@@ -295,12 +314,13 @@ def build_cka_matrix(activations: list) -> np.ndarray:
     return cka
 
 
-def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutations: int, seed: int):
+def group_similarity_test(cka: np.ndarray, groups: np.ndarray, n_permutations: int, seed: int):
     """Mantel-style permutation test: is the observed gap between mean
-    within-quarter and mean between-quarter CKA bigger than chance, given
-    this exact similarity matrix? Reshuffles quarter LABELS (not the
-    matrix) each draw, so the null respects the real similarity
-    structure -- only whether quarter happens to explain any of it.
+    within-group and mean between-group CKA bigger than chance, given
+    this exact similarity matrix? `groups` can be quarters, years, or any
+    other per-checkpoint label -- see --group-by. Reshuffles group LABELS
+    (not the matrix) each draw, so the null respects the real similarity
+    structure -- only whether this grouping happens to explain any of it.
 
     Also reports a standardized effect size (gap / pooled SD of the two
     groups, i.e. Cohen's d) alongside the p-value. With --n-probes in the
@@ -310,15 +330,15 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
     not hypothetical -- see this script's own first real run). p<0.05
     answers "is the gap exactly zero"; effect size answers "does the gap
     matter". Report both, trust neither alone."""
-    n = len(quarters)
+    n = len(groups)
     iu = np.triu_indices(n, k=1)
     pairs = cka[iu]
 
-    same_mask = quarters[iu[0]] == quarters[iu[1]]
+    same_mask = groups[iu[0]] == groups[iu[1]]
     same_vals, diff_vals = pairs[same_mask], pairs[~same_mask]
 
-    # With too few checkpoints per quarter (e.g. exactly 1 per quarter,
-    # as in a single-year run), there may be literally ZERO within-quarter
+    # With too few checkpoints per group (e.g. exactly 1 per quarter, as
+    # in a single-year run), there may be literally ZERO within-group
     # PAIRS to compare at all -- not a null result, a sample-size problem.
     # Catch this explicitly rather than letting it fall through to NaN
     # means / NaN p-value, which main() would otherwise misreport as "no
@@ -326,8 +346,8 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
     if len(same_vals) == 0 or len(diff_vals) == 0:
         return {
             "observed_gap": float("nan"),
-            "mean_within_quarter_cka": float(same_vals.mean()) if len(same_vals) else float("nan"),
-            "mean_between_quarter_cka": float(diff_vals.mean()) if len(diff_vals) else float("nan"),
+            "mean_within_group_cka": float(same_vals.mean()) if len(same_vals) else float("nan"),
+            "mean_between_group_cka": float(diff_vals.mean()) if len(diff_vals) else float("nan"),
             "effect_size_cohens_d": float("nan"),
             "min_pairwise_cka": float(pairs.min()) if len(pairs) else float("nan"),
             "p_value": float("nan"),
@@ -341,9 +361,9 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
             return np.nan
         return pairs[same].mean() - pairs[~same].mean()
 
-    observed = gap_for(quarters)
+    observed = gap_for(groups)
     rng = np.random.default_rng(seed)
-    null = np.array([gap_for(rng.permutation(quarters)) for _ in range(n_permutations)])
+    null = np.array([gap_for(rng.permutation(groups)) for _ in range(n_permutations)])
     null = null[~np.isnan(null)]
     p_value = float(np.mean(null >= observed)) if len(null) else float("nan")
 
@@ -358,8 +378,8 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
 
     return {
         "observed_gap": float(observed),
-        "mean_within_quarter_cka": float(same_vals.mean()),
-        "mean_between_quarter_cka": float(diff_vals.mean()),
+        "mean_within_group_cka": float(same_vals.mean()),
+        "mean_between_group_cka": float(diff_vals.mean()),
         "effect_size_cohens_d": effect_size,
         "min_pairwise_cka": float(pairs.min()),
         "p_value": p_value,
@@ -368,8 +388,30 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
     }
 
 
-def plot_cka_heatmap(cka: pd.DataFrame, meta: pd.DataFrame, title: str, out_path: str):
-    order = meta.sort_values(["quarter", "state", "year"]).index.to_numpy()
+# Dataviz-skill-validated categorical palette (hue + marker shape, so a
+# 5th+ category is still distinguishable without relying on hue alone).
+# QUARTER_STYLE uses the first four of these; non-quarter groupings (e.g.
+# --group-by year) reuse the same palette via assign_group_styles below
+# so every grouping gets a consistent, colorblind-aware look.
+GROUP_PALETTE = [
+    ("#2a78d6", "o"), ("#eb6834", "s"), ("#1baf7a", "^"), ("#eda100", "D"),
+    ("#e87ba4", "v"), ("#4a3aa7", "P"), ("#e34948", "X"), ("#008300", "*"),
+]
+
+
+def assign_group_styles(values) -> dict:
+    """Map each distinct value (sorted) to a {color, marker, label} style,
+    cycling GROUP_PALETTE if there are more than 8 distinct values."""
+    styles = {}
+    for i, v in enumerate(sorted(values)):
+        color, marker = GROUP_PALETTE[i % len(GROUP_PALETTE)]
+        styles[v] = {"color": color, "marker": marker, "label": str(v)}
+    return styles
+
+
+def plot_cka_heatmap(cka: pd.DataFrame, meta: pd.DataFrame, title: str, out_path: str,
+                      group_col: str = "quarter"):
+    order = meta.sort_values([group_col, "state", "year", "quarter"]).index.to_numpy()
     ordered = cka.values[np.ix_(order, order)]
     labels = [f"{meta.loc[i, 'state']}{meta.loc[i, 'year']}Q{meta.loc[i, 'quarter']}" for i in order]
 
@@ -387,10 +429,10 @@ def plot_cka_heatmap(cka: pd.DataFrame, meta: pd.DataFrame, title: str, out_path
     ax.set_yticklabels(labels, fontsize=6)
     ax.set_title(title)
 
-    # Mark quarter-block boundaries so same-quarter submatrices are easy
-    # to compare against the off-block (cross-quarter) regions by eye.
-    quarters_ordered = meta.loc[order, "quarter"].to_numpy()
-    boundaries = np.where(np.diff(quarters_ordered) != 0)[0] + 0.5
+    # Mark group-block boundaries so same-group submatrices are easy to
+    # compare against the off-block (cross-group) regions by eye.
+    groups_ordered = meta.loc[order, group_col].to_numpy()
+    boundaries = np.where(np.diff(groups_ordered) != 0)[0] + 0.5
     for b in boundaries:
         ax.axhline(b, color="white", lw=1.2)
         ax.axvline(b, color="white", lw=1.2)
@@ -402,28 +444,45 @@ def plot_cka_heatmap(cka: pd.DataFrame, meta: pd.DataFrame, title: str, out_path
     print(f"Wrote {out_path}")
 
 
-def plot_mds_embedding(meta: pd.DataFrame, cka: np.ndarray, title: str, out_path: str, seed: int):
+def plot_mds_embedding(meta: pd.DataFrame, cka: np.ndarray, title: str, out_path: str, seed: int,
+                        group_col: str = "quarter"):
     distance = np.clip(1 - cka, 0, None)
     np.fill_diagonal(distance, 0)
     mds = MDS(n_components=2, dissimilarity="precomputed", random_state=seed,
               normalized_stress="auto")
     coords = mds.fit_transform(distance)
 
+    # Preserve exact prior behavior for the default grouping; reuse the
+    # same palette (via assign_group_styles) for any other --group-by so
+    # every grouping gets a consistent, colorblind-aware look.
+    if group_col == "quarter":
+        styles = QUARTER_STYLE
+    else:
+        styles = assign_group_styles(meta[group_col].unique())
+
     fig, ax = plt.subplots(figsize=(8, 7))
-    for q in sorted(meta["quarter"].unique()):
-        style = QUARTER_STYLE.get(q, {"color": "#52514e", "marker": "x", "label": f"Q{q}"})
-        idx = (meta["quarter"] == q).to_numpy()
+    for g in sorted(meta[group_col].unique()):
+        style = styles.get(g, {"color": "#52514e", "marker": "x", "label": str(g)})
+        idx = (meta[group_col] == g).to_numpy()
         ax.scatter(coords[idx, 0], coords[idx, 1], c=style["color"], marker=style["marker"],
                    s=70, edgecolors="white", linewidths=0.6, label=style["label"], alpha=0.9)
     if len(meta) <= 40:
+        # Label points with whichever identifying info ISN'T already
+        # encoded by color: quarter grouping colors by season, so label
+        # by state+year; any other grouping colors by that column, so
+        # label by state+quarter instead.
+        if group_col == "quarter":
+            point_label = lambda row: f"{row.state}{row.year}"
+        else:
+            point_label = lambda row: f"{row.state}Q{row.quarter}"
         for (x, y), row in zip(coords, meta.itertuples()):
-            ax.annotate(f"{row.state}{row.year}", (x, y), fontsize=7, color="#52514e",
+            ax.annotate(point_label(row), (x, y), fontsize=7, color="#52514e",
                         xytext=(4, 4), textcoords="offset points")
 
     ax.set_xlabel("MDS 1")
     ax.set_ylabel("MDS 2")
     ax.set_title(title)
-    ax.legend(title="Quarter", frameon=False)
+    ax.legend(title=group_col.capitalize(), frameon=False)
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -433,10 +492,22 @@ def plot_mds_embedding(meta: pd.DataFrame, cka: np.ndarray, title: str, out_path
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--states", required=True, nargs="+")
-    p.add_argument("--years", required=True, nargs="+", type=int)
+    p.add_argument("--states", nargs="+", help="Required unless --cka-matrix/--meta are given")
+    p.add_argument("--years", nargs="+", type=int, help="Required unless --cka-matrix/--meta are given")
     p.add_argument("--quarters", nargs="+", type=int, default=[1, 2, 3, 4], choices=[1, 2, 3, 4])
-    p.add_argument("--variable", required=True)
+    p.add_argument("--variable", help="Required unless --cka-matrix/--meta are given")
+    p.add_argument("--group-by", choices=["quarter", "year"], default="quarter",
+                    help="Grouping column for the significance test/plots (default: quarter). "
+                         "A visually spread-out CKA heatmap with a null 'by quarter' result may "
+                         "still have a real difference organized by year instead -- rerun with "
+                         "--group-by year (ideally via --cka-matrix/--meta, see below) to check.")
+    p.add_argument("--cka-matrix", default=None,
+                    help="Path to a previously saved cka_matrix.csv. Must be given together with "
+                         "--meta. Skips checkpoint discovery and activation collection entirely and "
+                         "reruns the significance test + plots directly against these saved results "
+                         "-- the cheap way to re-check a result under a different --group-by.")
+    p.add_argument("--meta", default=None,
+                    help="Path to a previously saved fc_function_meta.csv, matching --cka-matrix.")
     p.add_argument("--version", default=None, help="Trained version per checkpoint (default: latest existing)")
     p.add_argument("--use-state-registry", action="store_true",
                     help="Discover checkpoints via pipeline_configs/state_registry.yml instead of "
@@ -464,9 +535,35 @@ def main():
     out_dir = Path(args.out_dir or "./out_fc_function_similarity")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    registry = load_registry() if args.use_state_registry else None
-    states = [s.lower() for s in args.states]
+    if bool(args.cka_matrix) != bool(args.meta):
+        raise SystemExit("--cka-matrix and --meta must be given together.")
 
+    if args.cka_matrix:
+        # Reanalyze mode: skip checkpoint discovery and the (expensive)
+        # activation-collection step entirely, reusing a previously saved
+        # result -- e.g. to re-check --group-by year against a matrix
+        # that was only ever computed once.
+        cka_df = pd.read_csv(args.cka_matrix, index_col=0)
+        meta = pd.read_csv(args.meta)
+        if len(cka_df) != len(meta):
+            raise SystemExit(f"--cka-matrix has {len(cka_df)} row(s) but --meta has {len(meta)} "
+                              f"row(s) -- they must come from the same run.")
+        cka = cka_df.values
+        states = sorted(meta["state"].unique())
+        print(f"Reanalyze mode: loaded {len(meta)} checkpoint(s) from {args.cka_matrix} and {args.meta} "
+              f"(skipping checkpoint discovery/activation collection)")
+    else:
+        if not (args.states and args.years and args.variable):
+            raise SystemExit("--states, --years, and --variable are required unless --cka-matrix/--meta "
+                              "are given.")
+        registry = load_registry() if args.use_state_registry else None
+        states = [s.lower() for s in args.states]
+        cka, meta = _collect_and_build_cka(states, args, registry, out_dir)
+
+    group_similarity(cka, meta, args, out_dir, states)
+
+
+def _collect_and_build_cka(states, args, registry, out_dir):
     # Peek at the first checkpoint found to learn in_features (768 for
     # swin_v2_t today, but this way a different backbone just works) and,
     # for --probe-source real, in_channels (needed to rebuild the probe
@@ -518,26 +615,37 @@ def main():
     cka_df.to_csv(cka_path)
     print(f"Wrote {cka_path}")
 
-    quarters = meta["quarter"].to_numpy()
-    test = quarter_similarity_test(cka, quarters, args.n_permutations, args.seed)
+    meta_path = out_dir / "fc_function_meta.csv"
+    meta.to_csv(meta_path, index=False)
+    print(f"Wrote {meta_path}")
+
+    return cka, meta
+
+
+def group_similarity(cka: np.ndarray, meta: pd.DataFrame, args, out_dir: Path, states: list):
+    group_col = args.group_by
+    groups = meta[group_col].to_numpy()
+    test = group_similarity_test(cka, groups, args.n_permutations, args.seed)
+    test["group_by"] = group_col
+    cka_df = pd.DataFrame(cka)  # positional only; row order matches meta
+    variable_label = args.variable or "?"
+    title_suffix = f"{', '.join(s.upper() for s in states)}, {variable_label}"
+    test_path = out_dir / "group_similarity_test.csv"
 
     if test["insufficient_data"]:
-        print(f"\nCan't run the quarter-similarity test: no within-quarter OR no between-quarter "
-              f"pairs exist in this set of {len(meta)} checkpoint(s) (need at least 2 checkpoints "
-              f"in the SAME quarter, e.g. 2+ years, to form a within-quarter pair). This is a "
-              f"sample-size problem, not a null result -- add more --years to get repeat "
-              f"checkpoints per quarter.")
-        pd.DataFrame([test]).to_csv(out_dir / "quarter_similarity_test.csv", index=False)
-        meta_path = out_dir / "fc_function_meta.csv"
-        meta.to_csv(meta_path, index=False)
-        print(f"Wrote {meta_path} and {out_dir / 'quarter_similarity_test.csv'}")
-        title_suffix = f"{', '.join(s.upper() for s in states)}, {args.variable}"
+        print(f"\nCan't run the {group_col}-similarity test: no within-{group_col} OR no "
+              f"between-{group_col} pairs exist in this set of {len(meta)} checkpoint(s) (need at "
+              f"least 2 checkpoints in the SAME {group_col} to form a within-{group_col} pair). This "
+              f"is a sample-size problem, not a null result -- add more data to get repeat "
+              f"checkpoints per {group_col}.")
+        pd.DataFrame([test]).to_csv(test_path, index=False)
+        print(f"Wrote {test_path}")
         plot_cka_heatmap(cka_df, meta, f"FC head functional similarity (linear CKA)\n{title_suffix}",
-                          str(out_dir / "cka_heatmap.png"))
+                          str(out_dir / "cka_heatmap.png"), group_col=group_col)
         return
 
-    print(f"\nMean within-quarter CKA:  {test['mean_within_quarter_cka']:.4f}")
-    print(f"Mean between-quarter CKA: {test['mean_between_quarter_cka']:.4f}")
+    print(f"\nMean within-{group_col} CKA:  {test['mean_within_group_cka']:.4f}")
+    print(f"Mean between-{group_col} CKA: {test['mean_between_group_cka']:.4f}")
     print(f"Observed gap: {test['observed_gap']:+.4f}  "
           f"(permutation p={test['p_value']:.4g}, {test['n_permutations']} permutations, "
           f"effect size d={test['effect_size_cohens_d']:+.3f})")
@@ -551,41 +659,37 @@ def main():
     d = abs(test["effect_size_cohens_d"])
     if test["p_value"] < 0.05 and d >= 0.2:
         size_word = "large" if d >= 0.8 else ("medium" if d >= 0.5 else "small")
-        print(f"-> Statistically significant AND a {size_word} effect size (d={d:.2f}) -- same-quarter "
-              f"models are more functionally similar to each other than to other quarters' models, "
+        print(f"-> Statistically significant AND a {size_word} effect size (d={d:.2f}) -- same-{group_col} "
+              f"models are more functionally similar to each other than to other {group_col}s' models, "
               f"by a margin that isn't just a precise estimate of a near-zero gap.")
     elif test["p_value"] < 0.05:
         print(f"-> Statistically significant but the effect size is negligible (d={d:.2f}, within "
-              f"{test['mean_within_quarter_cka']:.4f} vs. between {test['mean_between_quarter_cka']:.4f} "
+              f"{test['mean_within_group_cka']:.4f} vs. between {test['mean_between_group_cka']:.4f} "
               f"-- agree to 3 decimal places). With this many probes the permutation test has power to "
               f"detect a gap this small; treat 'p<0.05' here as 'nonzero', not 'meaningful'. This does "
-              f"NOT support a real seasonal difference in the FC head's function.")
+              f"NOT support a real difference in the FC head's function organized by {group_col}.")
     else:
-        print("-> No detectable difference between within-quarter and between-quarter functional "
-              "similarity -- on this probe set, no evidence the FC head's function differs by "
-              "season.")
+        print(f"-> No detectable difference between within-{group_col} and between-{group_col} "
+              f"functional similarity -- on this probe set, no evidence the FC head's function "
+              f"differs by {group_col}.")
 
     if test["min_pairwise_cka"] >= 0.95:
         print(f"NOTE: every pairwise CKA in this run is >= {test['min_pairwise_cka']:.3f}, including "
-              f"across quarters -- all these heads look nearly identical on this synthetic probe set. "
+              f"across {group_col}s -- all these heads look nearly identical on this probe set. "
               f"That's consistent with a real finding (the heads genuinely converge to similar "
-              f"functions regardless of season), but it's equally consistent with the synthetic probe "
-              f"set (standard-normal vectors, not real backbone features) not stressing real "
-              f"functional differences -- see this script's docstring. If this result is surprising, "
-              f"the next step is swapping in real backbone features extracted from actual imagery as "
-              f"the probe set, not trusting a near-ceiling CKA score on its own.")
+              f"functions regardless of {group_col}), but it's equally consistent with the probe "
+              f"set not stressing real functional differences -- see this script's docstring. If "
+              f"this result is surprising, the next step is swapping in real backbone features "
+              f"(--probe-source real) as the probe set, not trusting a near-ceiling CKA score on "
+              f"its own.")
 
-    pd.DataFrame([test]).to_csv(out_dir / "quarter_similarity_test.csv", index=False)
+    pd.DataFrame([test]).to_csv(test_path, index=False)
+    print(f"Wrote {test_path}")
 
-    meta_path = out_dir / "fc_function_meta.csv"
-    meta.to_csv(meta_path, index=False)
-    print(f"Wrote {meta_path} and {out_dir / 'quarter_similarity_test.csv'}")
-
-    title_suffix = f"{', '.join(s.upper() for s in states)}, {args.variable}"
     plot_cka_heatmap(cka_df, meta, f"FC head functional similarity (linear CKA)\n{title_suffix}",
-                      str(out_dir / "cka_heatmap.png"))
+                      str(out_dir / "cka_heatmap.png"), group_col=group_col)
     plot_mds_embedding(meta, cka, f"MDS of FC head functional (dis)similarity\n{title_suffix}",
-                        str(out_dir / "mds_fc_function.png"), args.seed)
+                        str(out_dir / "mds_fc_function.png"), args.seed, group_col=group_col)
 
 
 if __name__ == "__main__":
