@@ -168,7 +168,16 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
     within-quarter and mean between-quarter CKA bigger than chance, given
     this exact similarity matrix? Reshuffles quarter LABELS (not the
     matrix) each draw, so the null respects the real similarity
-    structure -- only whether quarter happens to explain any of it."""
+    structure -- only whether quarter happens to explain any of it.
+
+    Also reports a standardized effect size (gap / pooled SD of the two
+    groups, i.e. Cohen's d) alongside the p-value. With --n-probes in the
+    thousands, CKA estimates are precise enough that the permutation test
+    can call a genuinely tiny gap "significant" (p<0.05 with within/
+    between means that agree to 3 decimal places is a real failure mode,
+    not hypothetical -- see this script's own first real run). p<0.05
+    answers "is the gap exactly zero"; effect size answers "does the gap
+    matter". Report both, trust neither alone."""
     n = len(quarters)
     iu = np.triu_indices(n, k=1)
     pairs = cka[iu]
@@ -186,10 +195,23 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
     p_value = float(np.mean(null >= observed)) if len(null) else float("nan")
 
     same_mask = quarters[iu[0]] == quarters[iu[1]]
+    same_vals, diff_vals = pairs[same_mask], pairs[~same_mask]
+
+    effect_size = float("nan")
+    if len(same_vals) > 1 and len(diff_vals) > 1:
+        pooled_sd = np.sqrt((same_vals.var(ddof=1) + diff_vals.var(ddof=1)) / 2)
+        # A numerically-near-zero (not just exactly-zero) pooled SD makes
+        # this ratio explode into a meaningless huge number rather than a
+        # real effect size -- guard with a small floor instead of `> 0`.
+        if pooled_sd > 1e-6:
+            effect_size = float(observed / pooled_sd)
+
     return {
         "observed_gap": float(observed),
-        "mean_within_quarter_cka": float(pairs[same_mask].mean()),
-        "mean_between_quarter_cka": float(pairs[~same_mask].mean()),
+        "mean_within_quarter_cka": float(same_vals.mean()),
+        "mean_between_quarter_cka": float(diff_vals.mean()),
+        "effect_size_cohens_d": effect_size,
+        "min_pairwise_cka": float(pairs.min()),
         "p_value": p_value,
         "n_permutations": len(null),
     }
@@ -233,7 +255,7 @@ def plot_mds_embedding(meta: pd.DataFrame, cka: np.ndarray, title: str, out_path
     distance = np.clip(1 - cka, 0, None)
     np.fill_diagonal(distance, 0)
     mds = MDS(n_components=2, dissimilarity="precomputed", random_state=seed,
-              normalized_stress="auto", init="random")
+              normalized_stress="auto")
     coords = mds.fit_transform(distance)
 
     fig, ax = plt.subplots(figsize=(8, 7))
@@ -325,15 +347,42 @@ def main():
     print(f"\nMean within-quarter CKA:  {test['mean_within_quarter_cka']:.4f}")
     print(f"Mean between-quarter CKA: {test['mean_between_quarter_cka']:.4f}")
     print(f"Observed gap: {test['observed_gap']:+.4f}  "
-          f"(permutation p={test['p_value']:.4g}, {test['n_permutations']} permutations)")
-    if test["p_value"] < 0.05:
-        print("-> Same-quarter models are MORE functionally similar to each other than to other "
-              "quarters' models, more than chance would predict -- evidence the FC head's function "
-              "does differ by season.")
+          f"(permutation p={test['p_value']:.4g}, {test['n_permutations']} permutations, "
+          f"effect size d={test['effect_size_cohens_d']:+.3f})")
+
+    # p<0.05 answers "is the gap exactly zero"; with --n-probes in the
+    # thousands the test has enough power to call a trivial gap
+    # "significant". Effect size (Cohen's d on the pooled within/between
+    # distributions) answers "does the gap matter" -- gate the claim on
+    # both, using the standard small/medium/large thresholds (0.2/0.5/0.8)
+    # rather than reporting significance alone.
+    d = abs(test["effect_size_cohens_d"])
+    if test["p_value"] < 0.05 and d >= 0.2:
+        size_word = "large" if d >= 0.8 else ("medium" if d >= 0.5 else "small")
+        print(f"-> Statistically significant AND a {size_word} effect size (d={d:.2f}) -- same-quarter "
+              f"models are more functionally similar to each other than to other quarters' models, "
+              f"by a margin that isn't just a precise estimate of a near-zero gap.")
+    elif test["p_value"] < 0.05:
+        print(f"-> Statistically significant but the effect size is negligible (d={d:.2f}, within "
+              f"{test['mean_within_quarter_cka']:.4f} vs. between {test['mean_between_quarter_cka']:.4f} "
+              f"-- agree to 3 decimal places). With this many probes the permutation test has power to "
+              f"detect a gap this small; treat 'p<0.05' here as 'nonzero', not 'meaningful'. This does "
+              f"NOT support a real seasonal difference in the FC head's function.")
     else:
         print("-> No detectable difference between within-quarter and between-quarter functional "
               "similarity -- on this probe set, no evidence the FC head's function differs by "
               "season.")
+
+    if test["min_pairwise_cka"] >= 0.95:
+        print(f"NOTE: every pairwise CKA in this run is >= {test['min_pairwise_cka']:.3f}, including "
+              f"across quarters -- all these heads look nearly identical on this synthetic probe set. "
+              f"That's consistent with a real finding (the heads genuinely converge to similar "
+              f"functions regardless of season), but it's equally consistent with the synthetic probe "
+              f"set (standard-normal vectors, not real backbone features) not stressing real "
+              f"functional differences -- see this script's docstring. If this result is surprising, "
+              f"the next step is swapping in real backbone features extracted from actual imagery as "
+              f"the probe set, not trusting a near-ceiling CKA score on its own.")
+
     pd.DataFrame([test]).to_csv(out_dir / "quarter_similarity_test.csv", index=False)
 
     meta_path = out_dir / "fc_function_meta.csv"
