@@ -25,16 +25,22 @@ raw weight comparison unreliable here -- and it's the standard tool in
 deep learning interpretability for "do two differently-parameterized
 networks compute the same function."
 
-Probe set caveat: these are synthetic (standard normal) vectors in the
-backbone's 768-dim feature space, not real features extracted from actual
-imagery through each model's own (also fine-tuned, and so also somewhat
-season-specific) backbone. That isolates the HEAD's function specifically
--- matching the original "FC weights" question -- at the cost of probing
-regions of feature space real Swin features may never actually visit.
-Treat a result here as "do these heads implement different functions on
-a generic probe distribution," not "do they behave differently on real
-imagery." Extending this to real extracted features is future work, not
-done here.
+Probe set: --probe-source synthetic (default) uses standard-normal
+vectors in the backbone's 768-dim feature space -- no torchvision/real
+imagery needed, isolates the HEAD's function specifically, at the cost of
+probing regions of feature space real Swin features may never actually
+visit. --probe-source real instead extracts REAL backbone features from
+actual chips sampled across the whole --states/--years/--quarters grid,
+run through a FROZEN pretrained swin_v2_t backbone (ImageNet weights,
+with the stem conv rebuilt for the real band count the same way sail's
+own SwinRegressor.build() does -- see build_backbone()) -- deliberately
+NOT fine-tuned on any model's own task, so the probe distribution isn't
+itself biased toward one season's backbone. This needs torchvision +
+rasterio + band_mean/band_std filled in for every --states entry in
+pipeline_configs/state_registry.yml (there's no other source of truth
+for those in this project), and is substantially more expensive per
+probe (a real backbone forward pass vs. a matrix lookup) -- consider a
+smaller --n-probes (e.g. 200-500) unless running on a GPU node.
 
 For whether any apparent season clustering is more than chance, this
 runs a permutation test directly on the pairwise CKA matrix (Mantel-test
@@ -50,6 +56,8 @@ Usage:
 
 import argparse
 import itertools
+import os
+import random
 import sys
 from pathlib import Path
 
@@ -60,7 +68,7 @@ import torch
 from sklearn.manifold import MDS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from build_cross_quarter_r2_matrix import load_registry  # noqa: E402
+from build_cross_quarter_r2_matrix import load_registry, resolve_state_settings  # noqa: E402
 from analyze_transfer_penalty_landcover import DEFAULT_DATA_ROOT_TEMPLATE  # noqa: E402
 from extract_fc_weights_tsne import (  # noqa: E402
     find_checkpoint, resolve_ckpt_dir_fn, QUARTER_STYLE,
@@ -117,6 +125,130 @@ def linear_cka(X: np.ndarray, Y: np.ndarray) -> float:
 def build_probe_set(in_features: int, n_probes: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(seed)
     return rng.normal(0, 1, size=(n_probes, in_features)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------
+# --probe-source real: extract real backbone features instead of using
+# synthetic Gaussian vectors. Heavier (torchvision + rasterio + real
+# imagery + band stats), so kept separate from the lightweight synthetic
+# path above -- these imports stay local to the functions that need them
+# so --probe-source synthetic never requires torchvision/rasterio.
+# ---------------------------------------------------------------------
+def resolve_data_root(state: str, year: int, quarter: int, args) -> str:
+    """<data_root>/ for this (state, year, quarter) -- NOT the checkpoint
+    dir. Chips live under <data_root>/chips/, independent of whether a
+    trained model even exists for that cell (a probe image only needs to
+    have been downloaded, not trained on)."""
+    if args.use_state_registry:
+        registry = load_registry()
+        st = resolve_state_settings(state, registry)
+        data_root = st["data_root_template"].format(state=state, year=year, quarter=quarter)
+    else:
+        data_root = args.data_root_template.format(state=state, year=year, quarter=quarter)
+    return data_root if data_root.endswith("/") else data_root + "/"
+
+
+def resolve_band_stats(state: str, registry: dict):
+    """band_mean/band_std always come from state_registry.yml regardless
+    of --use-state-registry (that flag only controls CHECKPOINT
+    discovery) -- there's no other source of truth for them in this
+    project."""
+    entry = registry.get(state, {})
+    band_mean, band_std = entry.get("band_mean"), entry.get("band_std")
+    if band_mean is None or band_std is None:
+        raise SystemExit(f"--probe-source real needs band_mean/band_std for {state!r} in "
+                          f"pipeline_configs/state_registry.yml (run compute_shared_band_stats.py "
+                          f"for it first) -- not filled in yet.")
+    return band_mean, band_std
+
+
+def sample_probe_chips(states, years, quarters, args, n_probes: int, seed: int):
+    """Real chip paths (path, state), sampled across every (state, year,
+    quarter) cell in the analysis grid -- the same quarters being
+    compared, not one fixed reference quarter, so the probe distribution
+    reflects the real diversity of inputs these specific models actually
+    see rather than being anchored to a single season's idiosyncrasies."""
+    import glob
+    cells = list(itertools.product(states, years, quarters))
+    rng = random.Random(seed)
+    per_cell = max(1, n_probes // len(cells))
+    chips = []
+    for state, year, quarter in cells:
+        chips_dir = os.path.join(resolve_data_root(state, year, quarter, args), "chips")
+        available = sorted(glob.glob(os.path.join(chips_dir, "*.tif")))
+        if not available:
+            print(f"[probe chips] {state} Q{quarter} {year}: no chips under {chips_dir}, skipping")
+            continue
+        sample = available if len(available) <= per_cell else rng.sample(available, per_cell)
+        chips.extend((p, state) for p in sample)
+        print(f"[probe chips] {state} Q{quarter} {year}: sampled {len(sample)} / {len(available)} chips")
+    if not chips:
+        raise SystemExit("No probe chips found across the whole --states/--years/--quarters grid "
+                          "-- check that imagery has actually been downloaded for these cells.")
+    return chips
+
+
+def build_backbone(in_channels: int, device: str):
+    """torchvision's pretrained swin_v2_t (ImageNet weights only -- NOT
+    fine-tuned on any model's own task), stem conv rebuilt for in_channels
+    bands via sail's own warm-start logic (_expand_patch_embed_conv),
+    head replaced with Identity so forward() returns exactly the pooled
+    pre-head feature vector every checkpoint's head.0 actually receives
+    in production (torchvision's SwinTransformer.forward does
+    features -> norm -> permute -> avgpool -> flatten -> head, so
+    Identity in place of head gives the flattened pre-head vector
+    directly, no extra reshaping needed). Deliberately NOT fine-tuned on
+    any checkpoint's own weights: a neutral, season-agnostic feature
+    extractor, so the probe distribution isn't itself biased toward
+    whichever season's backbone it came from."""
+    import torch.nn as nn
+    import torchvision as tv
+    from sail.models.swin import _expand_patch_embed_conv
+
+    backbone = tv.models.swin_v2_t(weights="IMAGENET1K_V1")
+    if in_channels != 3:
+        old_conv = backbone.features[0][0]
+        backbone.features[0][0] = _expand_patch_embed_conv(old_conv, in_channels)
+    backbone.head = nn.Identity()
+    backbone.eval()
+    return backbone.to(device)
+
+
+def load_chip_tensor(path: str, img_size, band_mean, band_std, scale_divisor: float = 10000.0):
+    """Exact eval-time preprocessing sail's own dataloader uses for a
+    TIFF chip (see sail/src/sail/data/adapters.py::_load_tiff_tensor +
+    _TiffAugment.__call__ with train=False: resize then normalize, no
+    augmentation). Reimplemented directly here rather than importing
+    sail's dataset classes, since those pull in a lot more (coords.json/
+    ys.json resolution, splitting, etc.) than loading one chip needs."""
+    import rasterio
+    import torchvision.transforms.functional as TF
+    with rasterio.open(path) as src:
+        arr = src.read().astype("float32")
+    img = torch.from_numpy(arr) / scale_divisor
+    img = TF.resize(img, list(img_size))
+    img = TF.normalize(img, mean=band_mean, std=band_std)
+    return img
+
+
+def extract_real_probe_features(chips, band_stats_by_state, in_channels: int, img_size, device: str,
+                                 batch_size: int) -> np.ndarray:
+    """chips: list of (path, state). Returns (n_probes, 768) real
+    backbone features -- computed ONCE and shared across every
+    checkpoint's head comparison, the same role build_probe_set() plays
+    for the synthetic-probe path."""
+    backbone = build_backbone(in_channels, device)
+    all_features = []
+    with torch.no_grad():
+        for i in range(0, len(chips), batch_size):
+            batch = chips[i:i + batch_size]
+            tensors = [load_chip_tensor(path, img_size, *band_stats_by_state[state])
+                       for path, state in batch]
+            batch_tensor = torch.stack(tensors).to(device)
+            feats = backbone(batch_tensor)
+            all_features.append(feats.cpu().numpy())
+            print(f"[probe features] {min(i + batch_size, len(chips))}/{len(chips)}")
+    return np.concatenate(all_features, axis=0).astype(np.float32)
 
 
 def collect_activations(states, years, quarters, variable, args, registry, probes: np.ndarray):
@@ -182,6 +314,27 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
     iu = np.triu_indices(n, k=1)
     pairs = cka[iu]
 
+    same_mask = quarters[iu[0]] == quarters[iu[1]]
+    same_vals, diff_vals = pairs[same_mask], pairs[~same_mask]
+
+    # With too few checkpoints per quarter (e.g. exactly 1 per quarter,
+    # as in a single-year run), there may be literally ZERO within-quarter
+    # PAIRS to compare at all -- not a null result, a sample-size problem.
+    # Catch this explicitly rather than letting it fall through to NaN
+    # means / NaN p-value, which main() would otherwise misreport as "no
+    # detectable difference" (implying a real negative finding).
+    if len(same_vals) == 0 or len(diff_vals) == 0:
+        return {
+            "observed_gap": float("nan"),
+            "mean_within_quarter_cka": float(same_vals.mean()) if len(same_vals) else float("nan"),
+            "mean_between_quarter_cka": float(diff_vals.mean()) if len(diff_vals) else float("nan"),
+            "effect_size_cohens_d": float("nan"),
+            "min_pairwise_cka": float(pairs.min()) if len(pairs) else float("nan"),
+            "p_value": float("nan"),
+            "n_permutations": 0,
+            "insufficient_data": True,
+        }
+
     def gap_for(labels):
         same = labels[iu[0]] == labels[iu[1]]
         if same.sum() == 0 or (~same).sum() == 0:
@@ -193,9 +346,6 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
     null = np.array([gap_for(rng.permutation(quarters)) for _ in range(n_permutations)])
     null = null[~np.isnan(null)]
     p_value = float(np.mean(null >= observed)) if len(null) else float("nan")
-
-    same_mask = quarters[iu[0]] == quarters[iu[1]]
-    same_vals, diff_vals = pairs[same_mask], pairs[~same_mask]
 
     effect_size = float("nan")
     if len(same_vals) > 1 and len(diff_vals) > 1:
@@ -214,6 +364,7 @@ def quarter_similarity_test(cka: np.ndarray, quarters: np.ndarray, n_permutation
         "min_pairwise_cka": float(pairs.min()),
         "p_value": p_value,
         "n_permutations": len(null),
+        "insufficient_data": False,
     }
 
 
@@ -292,8 +443,18 @@ def main():
                          "--data-root-template")
     p.add_argument("--data-root-template", default=DEFAULT_DATA_ROOT_TEMPLATE,
                     help=f"Default: {DEFAULT_DATA_ROOT_TEMPLATE!r}")
+    p.add_argument("--probe-source", choices=["synthetic", "real"], default="synthetic",
+                    help="'synthetic' (default): standard-normal probe vectors, no torchvision/real "
+                         "imagery needed. 'real': extracts real backbone features from actual chips "
+                         "across the --states/--years/--quarters grid through a frozen pretrained "
+                         "swin_v2_t backbone -- see this script's docstring for the full tradeoff.")
     p.add_argument("--n-probes", type=int, default=2000,
-                    help="Synthetic probe vectors in backbone-feature space (default 2000)")
+                    help="Probe count (default 2000; with --probe-source real, each one is a real "
+                         "backbone forward pass -- consider 200-500 unless on a GPU node)")
+    p.add_argument("--img-size", type=int, nargs=2, default=[256, 256],
+                    help="Only used with --probe-source real (default: 256 256, matching sail's own configs)")
+    p.add_argument("--probe-device", default="cpu", help="Only used with --probe-source real")
+    p.add_argument("--probe-batch-size", type=int, default=32, help="Only used with --probe-source real")
     p.add_argument("--n-permutations", type=int, default=2000,
                     help="Permutations for the quarter-similarity significance test (default 2000)")
     p.add_argument("--seed", type=int, default=1337)
@@ -306,12 +467,13 @@ def main():
     registry = load_registry() if args.use_state_registry else None
     states = [s.lower() for s in args.states]
 
-    # in_features is read from the first checkpoint found rather than
-    # hardcoded (768 for swin_v2_t today, but this way a different
-    # backbone just works): a quick first pass to discover ONE checkpoint
-    # before building the real, shared probe set every model needs to be
-    # evaluated on identically.
+    # Peek at the first checkpoint found to learn in_features (768 for
+    # swin_v2_t today, but this way a different backbone just works) and,
+    # for --probe-source real, in_channels (needed to rebuild the probe
+    # backbone's stem conv to match) -- both read straight from the raw
+    # checkpoint rather than hardcoded.
     probe_in_features = None
+    probe_in_channels = None
     for state in states:
         ckpt_dir_fn = resolve_ckpt_dir_fn(state, args.variable, args, registry)
         for year, quarter in itertools.product(args.years, args.quarters):
@@ -321,15 +483,29 @@ def main():
                 continue
             _, ckpt_path = find_checkpoint(ckpt_dir)
             if ckpt_path is not None:
-                probe_in_features = load_head_params(ckpt_path)["W0"].shape[1]
+                raw_ckpt = torch.load(ckpt_path, map_location="cpu")
+                probe_in_features = raw_ckpt["state_dict"]["head.0.weight"].shape[1]
+                probe_in_channels = raw_ckpt.get("in_channels", 3)
                 break
         if probe_in_features is not None:
             break
     if probe_in_features is None:
         raise SystemExit("No checkpoints found -- can't even determine the probe dimensionality.")
 
-    probes = build_probe_set(probe_in_features, args.n_probes, args.seed)
-    print(f"Probe set: {args.n_probes} x {probe_in_features}-dim synthetic vectors (seed={args.seed})")
+    if args.probe_source == "real":
+        band_registry = load_registry()
+        band_stats_by_state = {state: resolve_band_stats(state, band_registry) for state in states}
+        chips = sample_probe_chips(states, args.years, args.quarters, args, args.n_probes, args.seed)
+        probes = extract_real_probe_features(chips, band_stats_by_state, probe_in_channels,
+                                              args.img_size, args.probe_device, args.probe_batch_size)
+        print(f"\nProbe set: {probes.shape[0]} real backbone feature(s), {probes.shape[1]}-dim "
+              f"(in_channels={probe_in_channels}, extracted via a frozen pretrained swin_v2_t)")
+        if probes.shape[1] != probe_in_features:
+            raise SystemExit(f"Real probe features are {probes.shape[1]}-dim but checkpoints expect "
+                              f"{probe_in_features}-dim input -- architecture mismatch.")
+    else:
+        probes = build_probe_set(probe_in_features, args.n_probes, args.seed)
+        print(f"Probe set: {args.n_probes} x {probe_in_features}-dim synthetic vectors (seed={args.seed})")
 
     meta, activations = collect_activations(states, args.years, args.quarters, args.variable,
                                              args, registry, probes)
@@ -344,6 +520,22 @@ def main():
 
     quarters = meta["quarter"].to_numpy()
     test = quarter_similarity_test(cka, quarters, args.n_permutations, args.seed)
+
+    if test["insufficient_data"]:
+        print(f"\nCan't run the quarter-similarity test: no within-quarter OR no between-quarter "
+              f"pairs exist in this set of {len(meta)} checkpoint(s) (need at least 2 checkpoints "
+              f"in the SAME quarter, e.g. 2+ years, to form a within-quarter pair). This is a "
+              f"sample-size problem, not a null result -- add more --years to get repeat "
+              f"checkpoints per quarter.")
+        pd.DataFrame([test]).to_csv(out_dir / "quarter_similarity_test.csv", index=False)
+        meta_path = out_dir / "fc_function_meta.csv"
+        meta.to_csv(meta_path, index=False)
+        print(f"Wrote {meta_path} and {out_dir / 'quarter_similarity_test.csv'}")
+        title_suffix = f"{', '.join(s.upper() for s in states)}, {args.variable}"
+        plot_cka_heatmap(cka_df, meta, f"FC head functional similarity (linear CKA)\n{title_suffix}",
+                          str(out_dir / "cka_heatmap.png"))
+        return
+
     print(f"\nMean within-quarter CKA:  {test['mean_within_quarter_cka']:.4f}")
     print(f"Mean between-quarter CKA: {test['mean_between_quarter_cka']:.4f}")
     print(f"Observed gap: {test['observed_gap']:+.4f}  "
