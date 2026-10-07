@@ -7,6 +7,17 @@ wc
 __pycache__/
 1_data_prep/test_lc/
 
+# compute_landcover.py's raw ESA WorldCover tile downloads -- always
+# written to <--out-dir>/wc_tiles/ regardless of what --out-dir is (see
+# download_tiles()'s out_dir / "wc_tiles" call), so this catches it even
+# when --out-dir isn't the default ./wc (which the "wc" entry above only
+# catches by coincidence). Each tile is 50-100+ MB and GitHub rejects
+# pushes with files over 100MB outright -- these are a re-downloadable
+# cache (compute_landcover.py re-fetches anything missing), never meant
+# to be committed.
+wc_tiles/
+*.tif
+
 # sail train/validate configs are fully reconstructible from
 # pipeline_configs/state_registry.yml + generate_train_config.py /
 # generate_validate_config.py -- not worth versioning each run (matches
