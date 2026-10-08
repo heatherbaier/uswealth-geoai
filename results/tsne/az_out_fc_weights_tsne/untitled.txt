@@ -1,0 +1,43 @@
+python 3_analysis/analyze_fc_function_similarity.py \
+    --states ga --years 2016 2017 2018 2019 --quarters 1 2 3 4 \
+    --variable wealth_index --out-dir ./ga_out_fc_function_similarity
+
+
+python 3_analysis/analyze_fc_function_similarity.py \
+    --states az --years 2016 2017 2018 2019 --quarters 1 2 3 4 \
+    --variable wealth_index --out-dir ./az_out_fc_function_similarity
+
+
+python 3_analysis/analyze_fc_function_similarity.py \
+    --states pa --years 2016 2017 2018 2019 --quarters 1 2 3 4 \
+    --variable wealth_index --out-dir ./pa_out_fc_function_similarity
+
+
+python 3_analysis/analyze_fc_function_similarity.py \
+    --states oh --years 2016 2017 2018 2019 --quarters 1 2 3 4 \
+    --variable wealth_index --out-dir ./oh_out_fc_function_similarity
+
+
+
+python 3_analysis/analyze_fc_function_similarity.py \
+    --states pa --years 2016 2017 2018 2019 --quarters 1 2 3 4 \
+    --variable wealth_index --probe-source real --n-probes 2000 \
+    --out-dir ./pa_out_fc_function_similarity_real
+
+
+python 3_analysis/analyze_fc_function_similarity.py \
+    --states oh --years 2016 2017 2018 2019 --quarters 1 2 3 4 \
+    --variable wealth_index --probe-source real --n-probes 300 \
+    --out-dir ./oh_out_fc_function_similarity_real
+
+
+python 3_analysis/analyze_fc_function_similarity.py \
+    --states pa --years 2016 2017 2018 2019 --quarters 1 2 3 4 \
+    --variable wealth_index --probe-source real --n-probes 300 \
+    --out-dir ./pa_out_fc_function_similarity_real_year --group-by year
+
+
+python 3_analysis/analyze_fc_function_similarity.py \
+    --states az --years 2016 2017 2018 2019 --quarters 1 2 3 4 \
+    --variable wealth_index --probe-source real --n-probes 300 \
+    --out-dir ./az_out_fc_function_similarity_real_year --groupy-by year
