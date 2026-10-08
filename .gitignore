@@ -21,3 +21,4 @@ slurm_files
 
 
 wc_tiles/
+!modeling_results/**/*.csv
