@@ -100,10 +100,26 @@ def load_wealth_csv(path: str, targets: list) -> dict:
 
 
 def discover_prefix(data_root: str) -> str:
+    """The ONE original <prefix>_ys.json geoetl wrote -- used only to read
+    the chip path list + coords, never the label values. On a fresh
+    data_root this is the only *_ys.json present. But this script's own
+    earlier runs write <original_prefix>_<target>_ys.json per target, so
+    re-running it later (e.g. to add more --targets, as in the original
+    docstring usage) finds those too. Every one of THIS script's own
+    outputs extends the original's prefix by "_<target>", so the original
+    is identifiable as the shortest prefix that every other match starts
+    with -- not just "the only match"."""
     matches = sorted(glob.glob(os.path.join(data_root, "*_ys.json")))
-    if len(matches) != 1:
-        raise SystemExit(f"{data_root}: expected exactly 1 *_ys.json, found {len(matches)}: {matches}")
-    return os.path.basename(matches[0])[: -len("_ys.json")]
+    if not matches:
+        raise SystemExit(f"{data_root}: found no *_ys.json")
+    names = [os.path.basename(m)[: -len("_ys.json")] for m in matches]
+    original = min(names, key=len)
+    not_derived = [n for n in names if n != original and not n.startswith(original + "_")]
+    if not_derived:
+        raise SystemExit(f"{data_root}: found {len(matches)} *_ys.json files and couldn't tell "
+                          f"which is the original geoetl one -- {not_derived} don't look like "
+                          f"{original!r} + '_<target>'. Matches: {matches}")
+    return original
 
 
 def process_data_root(data_root: str, wealth_rows: dict, targets: list):
