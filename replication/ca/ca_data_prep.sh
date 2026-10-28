@@ -25,6 +25,14 @@ python 1_data_prep/update_ys_labels.py \
  --wealth-csv /home/hbaier/projects/tlags_v2/data/wealth_indices_2019_USA.csv
 
 
+python 1_data_prep/update_ys_labels.py \
+    --data-roots /data/hbaier/new_data/tlag/ca_imagery/q1_2019_s2_allbands/ \
+/data/hbaier/new_data/tlag/ca_imagery/q2_2019_s2_allbands/ \
+/data/hbaier/new_data/tlag/ca_imagery/q3_2019_s2_allbands/ \
+/data/hbaier/new_data/tlag/ca_imagery/q4_2019_s2_allbands/ \
+ --wealth-csv /home/hbaier/projects/tlags_v2/data/wealth_indices_2019_USA.csv
+
+
 # Calculate band mean and std statistics for pipeline_configs/state_registry.yml
 
 python 1_data_prep/compute_shared_band_stats.py \

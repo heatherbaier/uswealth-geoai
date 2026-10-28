@@ -81,6 +81,10 @@ TARGET_CHOICES = [
     "wealth_index_transport",
     "wealth_index_financial",
     "wealth_index_utilities",
+    "gas_heat_pct",
+    "log_home_value",
+    "single_family_pct",
+    "rent_burdened_30plus_pct"
 ]
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
