@@ -17,6 +17,15 @@ runs (generate_cross_validate_config.py) deliberately write there instead
 up here and break the "exactly 1 match = this model's own held-out test
 set" assumption this script depends on.
 
+Once more than one target variable has been trained for a state, each
+quarter's artifacts/ has one experiment dir PER variable (exp_base =
+f"{state}_q{quarter}_{year}_{variable}", same convention as
+build_cross_quarter_r2_matrix.py/analyze_transfer_penalty_landcover.py),
+so the default glob's `artifacts/*/` now matches all of them --
+pass --variable to pick one (narrows the glob to that experiment dir
+specifically) instead of silently trying to validate every variable's
+preds at once.
+
 Replaces the per-state validation_oh.ipynb / validation_az.ipynb notebooks
 (which were the same ~35 cells copy-pasted with different hardcoded paths,
 and a validation_az.ipynb left half-finished mid-copy) with one script
@@ -29,8 +38,10 @@ actually found.
 
 Usage:
     python validate.py --state oh --imagery-root /data/hbaier/new_data/tlag/imagery
+
+    # Multiple variables trained for this state -- pick one:
     python validate.py --state az --imagery-root /data/hbaier/new_data/tlag/az_imagery \
-        --out-dir ./out_validation/az
+        --variable wealth_index_sat --out-dir ./out_validation/az_wealth_index_sat
 """
 
 import argparse
@@ -42,8 +53,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import r2_score
 
+# Experiment dir naming convention shared with build_cross_quarter_r2_matrix.py /
+# analyze_transfer_penalty_landcover.py: artifacts/<state>_q<quarter>_<year>_<variable>_v<N>/
+EXP_DIR_RE = re.compile(r"^.+_q\d_\d{4}_(?P<variable>.+)_v\d+$")
 
-def discover_quarter_preds(imagery_root: Path, preds_glob: str):
+
+def discover_quarter_preds(imagery_root: Path, preds_glob: str, variable: "str | None"):
     quarters = []
     for qdir in sorted(imagery_root.glob("q[1-4]_????_s2*")):
         m = re.match(r"q([1-4])_(\d{4})_s2", qdir.name)
@@ -51,6 +66,19 @@ def discover_quarter_preds(imagery_root: Path, preds_glob: str):
             continue
         quarter, year = int(m.group(1)), int(m.group(2))
         matches = sorted(qdir.glob(preds_glob))
+        if len(matches) > 1 and not variable:
+            # artifacts/*/ matched one experiment dir per trained variable
+            # (see EXP_DIR_RE) -- list what's actually available instead
+            # of guessing, or silently mixing variables' preds together.
+            found_vars = sorted({
+                vm.group("variable") for p in matches
+                if (vm := EXP_DIR_RE.match(p.parent.name))
+            })
+            hint = f" ({', '.join(found_vars)})" if found_vars else ""
+            print(f"Skipping {qdir.name}: found {len(matches)} preds CSVs matching "
+                  f"'{preds_glob}' -- multiple variables trained here{hint}; "
+                  f"pass --variable to pick one")
+            continue
         if len(matches) != 1:
             print(f"Skipping {qdir.name}: found {len(matches)} preds CSVs "
                   f"matching '{preds_glob}' (expected exactly 1) -- run "
@@ -61,8 +89,8 @@ def discover_quarter_preds(imagery_root: Path, preds_glob: str):
     return quarters
 
 
-def validate_state(state, imagery_root, preds_glob, out_dir):
-    quarters = discover_quarter_preds(imagery_root, preds_glob)
+def validate_state(state, imagery_root, preds_glob, out_dir, variable=None):
+    quarters = discover_quarter_preds(imagery_root, preds_glob, variable)
     if not quarters:
         raise SystemExit(f"No quarters found under {imagery_root} matching '{preds_glob}'")
     print(f"[{state}] Found {len(quarters)} validated quarters")
@@ -114,13 +142,33 @@ def main():
     p.add_argument("--state", required=True, help="State label, e.g. oh/az/ca/ga/pa (used for output naming/titles only)")
     p.add_argument("--imagery-root", required=True, type=Path,
                     help="geoetl tlag imagery root for this state, e.g. .../tlag/az_imagery")
-    p.add_argument("--preds-glob", default="artifacts/*/epoch*_valset_*_preds.csv",
-                    help="Glob (relative to each q<n>_<year>_s2*/ dir) for the validate-task output CSV")
+    p.add_argument("--variable", default=None,
+                    help="Target variable to validate, e.g. wealth_index/wealth_index_sat -- "
+                         "required once more than one variable has been trained for this state "
+                         "(each gets its own artifacts/<...>_<variable>_v<N>/ experiment dir, so "
+                         "the default --preds-glob then matches more than one)")
+    p.add_argument("--preds-glob", default=None,
+                    help="Glob (relative to each q<n>_<year>_s2*/ dir) for the validate-task "
+                         "output CSV. Default: artifacts/*/epoch*_valset_*_preds.csv, narrowed to "
+                         "artifacts/*_<variable>_v*/epoch*_valset_*_preds.csv when --variable is given")
     p.add_argument("--out-dir", type=Path, default=None,
-                    help="Output dir (default: ./out_validation/<state>)")
+                    help="Output dir (default: ./out_validation/<state>, or "
+                         "./out_validation/<state>_<variable> when --variable is given)")
     args = p.parse_args()
-    out_dir = args.out_dir or Path(f"./out_validation/{args.state.lower()}")
-    validate_state(args.state, args.imagery_root, args.preds_glob, out_dir)
+
+    preds_glob = args.preds_glob
+    if preds_glob is None:
+        preds_glob = (f"artifacts/*_{args.variable}_v*/epoch*_valset_*_preds.csv" if args.variable
+                      else "artifacts/*/epoch*_valset_*_preds.csv")
+
+    if args.out_dir is not None:
+        out_dir = args.out_dir
+    elif args.variable:
+        out_dir = Path(f"./out_validation/{args.state.lower()}_{args.variable}")
+    else:
+        out_dir = Path(f"./out_validation/{args.state.lower()}")
+
+    validate_state(args.state, args.imagery_root, preds_glob, out_dir, variable=args.variable)
 
 
 if __name__ == "__main__":
