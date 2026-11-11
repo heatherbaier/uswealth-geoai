@@ -84,7 +84,9 @@ TARGET_CHOICES = [
     "gas_heat_pct",
     "log_home_value",
     "single_family_pct",
-    "rent_burdened_30plus_pct"
+    "rent_burdened_30plus_pct",
+    "owner_burdened_30plus_pct",
+    "solar_heat_pct"
 ]
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
