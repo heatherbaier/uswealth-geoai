@@ -54,11 +54,17 @@ Methods:
 Sign convention: delta_r2 = r2_base - r2_pert, delta_mae = mae_pert -
 mae_base -- both positive = "this band/group mattered".
 
-Caching: every (model_year, model_quarter, eval_year, eval_quarter)
-cell's loaded test tensors + baseline predictions/metrics are cached to
---cache-dir, so a rerun (e.g. adding a method or a repeat) doesn't reload
-imagery or redo the baseline forward pass. Skipped automatically unless
---overwrite.
+Caching: only each (model_year, model_quarter, eval_year, eval_quarter)
+cell's baseline predictions/metrics (a few floats) are cached to
+--cache-dir, so a rerun (e.g. adding a method or a repeat) doesn't redo
+the baseline forward pass -- skipped automatically unless --overwrite.
+The loaded test IMAGE tensors are NOT cached to disk: at 256x256x12
+channels that's ~3MB per test tract, and a --offdiag sweep visits many
+(model, eval) cells, so caching those adds up to tens of GB for no real
+reuse benefit (each cell is only ever loaded once per run). Images are
+freed explicitly (del + gc.collect(), plus torch.cuda.empty_cache() on
+GPU) right after each eval cell finishes, so memory doesn't climb over a
+long sweep.
 
 A missing checkpoint or missing imagery for any (model, eval) cell is
 skipped with a clear message, not a crash -- the --years/--quarters grid
@@ -81,6 +87,7 @@ Usage:
 """
 
 import argparse
+import gc
 import itertools
 import os
 import sys
@@ -174,24 +181,19 @@ def load_model_wrapper(ckpt_dir: str, in_channels: int, device: str):
 # -------------------------------------------------------------------------
 # Dataset loading + caching
 # -------------------------------------------------------------------------
-def cache_path(cache_dir: Path, state, variable, model_year, model_quarter, eval_year, eval_quarter):
-    name = f"{state}_{variable}_model{model_year}q{model_quarter}_eval{eval_year}q{eval_quarter}.pt"
-    return cache_dir / name
-
-
 def load_eval_cell(state, variable, model_ckpt_dir_path, model_year, model_quarter,
                     eval_year, eval_quarter, data_root_fn, prefix_fn, band_mean, band_std,
-                    img_size, batch_size, cache_dir, overwrite):
-    """Returns (images, coords, labels, n_test) for this (model, eval
-    quarter) cell -- the model's OWN held-out GEOIDs, as they appear in
-    eval_year/eval_quarter's imagery (see module docstring). Cached to
-    disk keyed by the full (model, eval) pair, since the restriction is a
-    function of the MODEL's own test_indices.txt."""
-    cpath = cache_path(cache_dir, state, variable, model_year, model_quarter, eval_year, eval_quarter)
-    if cpath.exists() and not overwrite:
-        d = torch.load(cpath, weights_only=False)
-        return d["images"], d["coords"], d["labels"]
-
+                    img_size, batch_size):
+    """Returns (images, coords, labels) for this (model, eval quarter)
+    cell -- the model's OWN held-out GEOIDs, as they appear in eval_year/
+    eval_quarter's imagery (see module docstring). NOT cached to disk:
+    images is (n_test, 12, H, W) float32 -- at 256x256 that's ~3MB per
+    test tract, so a few hundred (model, eval) cells (the --offdiag grid
+    gets big fast) adds up to tens of GB on disk for no real benefit,
+    since each cell is only ever loaded once per run anyway (nothing
+    inside a single run re-requests the same cell). Only the tiny
+    baseline predictions are cached (see get_baseline) -- that's what
+    --overwrite controls and what a rerun actually reuses."""
     data_root = data_root_fn(state, eval_year, eval_quarter)
     prefix = prefix_fn(eval_year, eval_quarter)
     cfg_dataset = {
@@ -202,9 +204,6 @@ def load_eval_cell(state, variable, model_ckpt_dir_path, model_year, model_quart
     cfg = {"dataset": cfg_dataset}
     ds = build_validation_dataset(cfg_dataset, cfg, model_ckpt_dir_path, temporal=False)
     images, coords, labels, _ = _load_full_dataset(ds, batch_size)
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    torch.save({"images": images, "coords": coords, "labels": labels}, cpath)
     return images, coords, labels
 
 
@@ -346,7 +345,6 @@ def run_model(state, variable, model_year, model_quarter, args, registry,
             images, coords, labels = load_eval_cell(
                 state, variable, ckpt_dir, model_year, model_quarter, eval_year, eval_quarter,
                 data_root_fn, prefix_fn, band_mean, band_std, args.img_size, args.batch_size,
-                cache_dir, args.overwrite,
             )
         except Exception as e:
             log(f"  [eval {state} Q{eval_quarter} {eval_year}] couldn't load this cell, skipping: {e}")
@@ -376,23 +374,32 @@ def run_model(state, variable, model_year, model_quarter, args, registry,
                 model_wrapper, images, coords, labels, args.device, args.batch_size,
                 context, r2_base, mae_base, r_base, n_test, args.n_repeats, args.seed, log,
             )
-            continue
+        else:
+            if "permutation" in args.methods:
+                all_rows += permutation_rows(
+                    model_wrapper, images, coords, labels, args.device, args.batch_size,
+                    context, r2_base, mae_base, r_base, n_test, args.n_repeats, args.seed, log,
+                )
+            if "group_permutation" in args.methods:
+                all_rows += group_permutation_rows(
+                    model_wrapper, images, coords, labels, args.device, args.batch_size,
+                    context, r2_base, mae_base, r_base, n_test, args.n_repeats, args.seed, log,
+                )
+            if "mean_ablation" in args.methods:
+                all_rows += mean_ablation_rows(
+                    model_wrapper, images, coords, labels, args.device, args.batch_size,
+                    context, r2_base, mae_base, r_base, n_test, log,
+                )
 
-        if "permutation" in args.methods:
-            all_rows += permutation_rows(
-                model_wrapper, images, coords, labels, args.device, args.batch_size,
-                context, r2_base, mae_base, r_base, n_test, args.n_repeats, args.seed, log,
-            )
-        if "group_permutation" in args.methods:
-            all_rows += group_permutation_rows(
-                model_wrapper, images, coords, labels, args.device, args.batch_size,
-                context, r2_base, mae_base, r_base, n_test, args.n_repeats, args.seed, log,
-            )
-        if "mean_ablation" in args.methods:
-            all_rows += mean_ablation_rows(
-                model_wrapper, images, coords, labels, args.device, args.batch_size,
-                context, r2_base, mae_base, r_base, n_test, log,
-            )
+        # images is (n_test, 12, H, W) float32 -- a few hundred MB per
+        # cell, and the --offdiag grid visits many cells per model. Drop
+        # it explicitly rather than waiting for the next loop iteration's
+        # reassignment, and release CUDA's caching allocator too, so RAM/
+        # GPU memory doesn't climb across a long sweep.
+        del images, coords, labels
+        gc.collect()
+        if args.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return all_rows
 
@@ -439,7 +446,6 @@ def run_sanity_check(state, variable, model_year, model_quarter, args, registry,
     images, coords, labels = load_eval_cell(
         state, variable, ckpt_dir, model_year, model_quarter, model_year, model_quarter,
         data_root_fn, prefix_fn, band_mean, band_std, args.img_size, args.batch_size,
-        cache_dir, args.overwrite,
     )
     n_test = images.shape[0]
     preds_base, r2_base, mae_base, r_base = get_baseline(
@@ -527,10 +533,12 @@ def main():
                     help=f"Default: {DEFAULT_BASE_PREFIX_TEMPLATE!r}")
     p.add_argument("--out-dir", default="3_analysis/outputs/band_importance")
     p.add_argument("--cache-dir", default=None,
-                    help="Default: <out-dir>/_cache")
+                    help="Where cached baseline predictions/metrics are kept (small -- test "
+                         "image tensors are never cached to disk, see module docstring). "
+                         "Default: <out-dir>/_cache")
     p.add_argument("--overwrite", action="store_true",
                     help="Recompute everything for this run instead of reusing cached "
-                         "tensors/baselines or skipping rows already in the output CSV")
+                         "baselines or skipping rows already in the output CSV")
     p.add_argument("--sanity-check", action="store_true",
                     help="Run only the 3 sanity checks against the FIRST (year, quarter) in "
                          "--years/--quarters, print PASS/FAIL, and exit -- no CSV written")
