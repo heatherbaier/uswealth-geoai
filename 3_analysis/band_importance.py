@@ -184,16 +184,19 @@ def load_model_wrapper(ckpt_dir: str, in_channels: int, device: str):
 def load_eval_cell(state, variable, model_ckpt_dir_path, model_year, model_quarter,
                     eval_year, eval_quarter, data_root_fn, prefix_fn, band_mean, band_std,
                     img_size, batch_size):
-    """Returns (images, coords, labels) for this (model, eval quarter)
-    cell -- the model's OWN held-out GEOIDs, as they appear in eval_year/
-    eval_quarter's imagery (see module docstring). NOT cached to disk:
-    images is (n_test, 12, H, W) float32 -- at 256x256 that's ~3MB per
-    test tract, so a few hundred (model, eval) cells (the --offdiag grid
-    gets big fast) adds up to tens of GB on disk for no real benefit,
-    since each cell is only ever loaded once per run anyway (nothing
-    inside a single run re-requests the same cell). Only the tiny
-    baseline predictions are cached (see get_baseline) -- that's what
-    --overwrite controls and what a rerun actually reuses."""
+    """Returns (images, coords, labels, names) for this (model, eval
+    quarter) cell -- the model's OWN held-out GEOIDs, as they appear in
+    eval_year/eval_quarter's imagery (see module docstring). names is the
+    chip path list (GEOID = Path(name).stem, geoetl's "{GEOID}.tif"
+    convention) -- most callers here don't need it, but amplitude_
+    predictions.py does, and returning it costs nothing. NOT cached to
+    disk: images is (n_test, 12, H, W) float32 -- at 256x256 that's ~3MB
+    per test tract, so a few hundred (model, eval) cells (the --offdiag
+    grid gets big fast) adds up to tens of GB on disk for no real
+    benefit, since each cell is only ever loaded once per run anyway
+    (nothing inside a single run re-requests the same cell). Only the
+    tiny baseline predictions are cached (see get_baseline) -- that's
+    what --overwrite controls and what a rerun actually reuses."""
     data_root = data_root_fn(state, eval_year, eval_quarter)
     prefix = prefix_fn(eval_year, eval_quarter)
     cfg_dataset = {
@@ -203,8 +206,8 @@ def load_eval_cell(state, variable, model_ckpt_dir_path, model_year, model_quart
     }
     cfg = {"dataset": cfg_dataset}
     ds = build_validation_dataset(cfg_dataset, cfg, model_ckpt_dir_path, temporal=False)
-    images, coords, labels, _ = _load_full_dataset(ds, batch_size)
-    return images, coords, labels
+    images, coords, labels, names = _load_full_dataset(ds, batch_size)
+    return images, coords, labels, names
 
 
 def baseline_cache_path(cache_dir: Path, state, variable, model_year, model_quarter, eval_year, eval_quarter):
@@ -342,7 +345,7 @@ def run_model(state, variable, model_year, model_quarter, args, registry,
     for eval_year, eval_quarter in eval_cells:
         is_diag = (eval_year, eval_quarter) == (model_year, model_quarter)
         try:
-            images, coords, labels = load_eval_cell(
+            images, coords, labels, _names = load_eval_cell(
                 state, variable, ckpt_dir, model_year, model_quarter, eval_year, eval_quarter,
                 data_root_fn, prefix_fn, band_mean, band_std, args.img_size, args.batch_size,
             )
@@ -443,7 +446,7 @@ def run_sanity_check(state, variable, model_year, model_quarter, args, registry,
     model_wrapper, epoch, ckpt_path = load_model_wrapper(ckpt_dir, in_channels, args.device)
     log(f"[sanity-check] {state} Q{model_quarter} {model_year}: loaded epoch {epoch}: {ckpt_path}")
 
-    images, coords, labels = load_eval_cell(
+    images, coords, labels, _names = load_eval_cell(
         state, variable, ckpt_dir, model_year, model_quarter, model_year, model_quarter,
         data_root_fn, prefix_fn, band_mean, band_std, args.img_size, args.batch_size,
     )
