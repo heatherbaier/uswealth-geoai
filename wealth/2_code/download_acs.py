@@ -8,8 +8,15 @@ index pipeline and saves two national CSVs.
   data/acs_wealth_variables_2010_2014_US.csv   (ACS 2010–2014, year=2014)
 
 The Census API caps at 50 variables per request.  The full variable set
-(63 columns) is split into two groups that are each fetched separately
+(68 columns) is split into two groups that are each fetched separately
 and then joined on geoid.
+
+race_total_pop/white_nonhispanic/black_nonhispanic/asian_nonhispanic/
+hispanic_latino (table B03002) were added for 3_analysis/compute_tract_
+covariates.py's urbanicity (population density, via race_total_pop /
+tract ALAND) and demographic-composition covariates -- both available
+for the 2010-2014 vintage too, unlike the broadband/computer variables
+below, so they're NOT in NOT_IN_2014.
 
 Usage
 -----
@@ -120,6 +127,16 @@ ACS_VARS_SUPPLEMENTAL = {
     "commute_transit":      "B08301_010E",
     "commute_walk":         "B08301_019E",
     "commute_work_home":    "B08301_021E",
+    # Population & race/ethnicity (added for 3_analysis/compute_tract_
+    # covariates.py -- B03002's total (line 001) doubles as the tract's
+    # total population for a density-based urbanicity proxy, so this one
+    # table covers both the "urbanicity" and "demographic composition"
+    # covariates without a third API call group).
+    "race_total_pop":       "B03002_001E",
+    "white_nonhispanic":    "B03002_003E",
+    "black_nonhispanic":    "B03002_004E",
+    "asian_nonhispanic":    "B03002_006E",
+    "hispanic_latino":      "B03002_012E",
 }
 
 # ── Download helpers ───────────────────────────────────────────────────────────
