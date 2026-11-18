@@ -60,6 +60,19 @@ Two checks on the resulting similarity matrix:
      importance-csv nor --cross-quarter-r2-csv is given -- the season/
      year clustering check above needs no transfer data at all.
 
+     The overall r alone can't tell "weight similarity predicts transfer
+     in general" apart from "same-season pairs are just both more
+     weight-similar AND higher-transfer, so the correlation is really
+     season identity counted twice." Three more rows split that apart:
+     the correlation within same-season pairs only, within different-
+     season pairs only, and a partial correlation controlling for both
+     same_season and same_year (residualize both variables on those two
+     dummies via OLS, correlate the residuals). If the partial
+     correlation survives close to the overall r, weight similarity
+     carries real information beyond season/year identity; if it
+     collapses toward 0, the overall correlation was mostly that
+     identity effect, not a continuous relationship.
+
 Output (per state):
     <out-dir>/<state>_<variable>_weight_similarity_matrix.csv   full
         model x model cosine similarity matrix
@@ -93,11 +106,13 @@ import argparse
 import gc
 import itertools
 import sys
+import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 import torch
 from scipy.stats import pearsonr
 
@@ -259,6 +274,52 @@ def correlate_with_transfer(pairs: pd.DataFrame):
     return {"pearson_r": float(r), "p_value": float(p), "n_pairs": len(sub)}
 
 
+def correlate_with_transfer_by_group(pairs: pd.DataFrame) -> pd.DataFrame:
+    """The overall Pearson r alone can't tell "weight similarity predicts
+    transfer accuracy in general" apart from "same-season pairs happen to
+    be both more weight-similar AND higher-transfer, so the correlation
+    is really just season identity showing up twice." Three additional
+    views split that apart:
+      - within same_season==1 pairs only
+      - within same_season==0 pairs only
+      - a partial correlation of cosine_similarity vs. pair_transfer_r2
+        that controls for BOTH same_season and same_year: residualize
+        each variable on those two dummies via OLS, then correlate the
+        residuals (the standard partial-correlation construction) -- if
+        this survives close to the overall r, weight similarity carries
+        real information beyond season/year identity; if it collapses
+        toward 0, the overall correlation was mostly that identity
+        effect counted twice."""
+    sub = pairs.dropna(subset=["pair_transfer_r2"])
+    rows = []
+
+    overall = correlate_with_transfer(pairs)
+    if overall is not None:
+        rows.append({"group": "overall", **overall})
+
+    for label, mask in [("same_season", sub["same_season"] == 1), ("different_season", sub["same_season"] == 0)]:
+        group = sub[mask]
+        if len(group) < 4:
+            print(f"  [{label}] only {len(group)} pair(s) after dropping NaNs -- skipping")
+            continue
+        r, p = pearsonr(group["cosine_similarity"], group["pair_transfer_r2"])
+        rows.append({"group": label, "pearson_r": float(r), "p_value": float(p), "n_pairs": len(group)})
+
+    if len(sub) >= 6:
+        controls = sm.add_constant(sub[["same_season", "same_year"]].astype(float))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            y_resid = sm.OLS(sub["pair_transfer_r2"], controls).fit().resid
+            x_resid = sm.OLS(sub["cosine_similarity"], controls).fit().resid
+        r, p = pearsonr(x_resid, y_resid)
+        rows.append({"group": "partial_controlling_for_season_and_year", "pearson_r": float(r),
+                     "p_value": float(p), "n_pairs": len(sub)})
+    else:
+        print(f"  [partial_controlling_for_season_and_year] only {len(sub)} pair(s) -- skipping")
+
+    return pd.DataFrame(rows)
+
+
 def plot_heatmap(sim_matrix: np.ndarray, meta: pd.DataFrame, title: str, out_path: Path):
     order = meta.sort_values(["year", "quarter"]).index.to_numpy()
     ordered = sim_matrix[np.ix_(order, order)]
@@ -285,11 +346,22 @@ def plot_heatmap(sim_matrix: np.ndarray, meta: pd.DataFrame, title: str, out_pat
 def plot_transfer_scatter(pairs: pd.DataFrame, title: str, out_path: Path):
     sub = pairs.dropna(subset=["pair_transfer_r2"])
     fig, ax = plt.subplots(figsize=(7, 6))
-    colors = np.where(sub["same_season"] == 1, "#1baf7a", "#2a78d6")
-    ax.scatter(sub["cosine_similarity"], sub["pair_transfer_r2"], c=colors, s=40, alpha=0.8,
-               edgecolors="white", linewidths=0.5)
-    ax.scatter([], [], c="#1baf7a", label="same season")
-    ax.scatter([], [], c="#2a78d6", label="different season")
+
+    # Per-group trend lines (not just color-coded points) -- this is the
+    # same split correlate_with_transfer_by_group() reports numerically:
+    # if the same-season and different-season lines have similar slopes,
+    # the relationship holds beyond season identity; if one is flat,
+    # that group's correlation is mostly/entirely the other one's.
+    for label, mask, color in [("same season", sub["same_season"] == 1, "#1baf7a"),
+                                ("different season", sub["same_season"] == 0, "#2a78d6")]:
+        group = sub[mask]
+        ax.scatter(group["cosine_similarity"], group["pair_transfer_r2"], c=color, s=40, alpha=0.8,
+                   edgecolors="white", linewidths=0.5, label=label)
+        if len(group) >= 4:
+            slope, intercept = np.polyfit(group["cosine_similarity"], group["pair_transfer_r2"], 1)
+            x_line = np.linspace(group["cosine_similarity"].min(), group["cosine_similarity"].max(), 50)
+            ax.plot(x_line, slope * x_line + intercept, color=color, linewidth=2, alpha=0.9)
+
     ax.set_xlabel("weight-delta cosine similarity")
     ax.set_ylabel("symmetrized transfer R^2")
     ax.set_title(title)
@@ -390,19 +462,20 @@ def main():
     cluster_df.to_csv(cluster_path, index=False)
     print(f"Wrote {cluster_path}")
 
-    corr = correlate_with_transfer(pairs)
+    print("\nWeight similarity vs. transfer R^2, by group:")
+    corr_df = correlate_with_transfer_by_group(pairs)
     corr_path = args.out_dir / f"{state_variable}_weight_vs_transfer_corr.csv"
-    if corr is None:
-        print("\nNot enough pairs with transfer R^2 to correlate -- skipping (and no corr CSV written)")
+    if corr_df.empty:
+        print("  Not enough pairs with transfer R^2 to correlate -- skipping (and no corr CSV written)")
     else:
-        print(f"\nWeight similarity vs. transfer R^2: pearson_r={corr['pearson_r']:+.4f} "
-              f"p={corr['p_value']:.4g} (n={corr['n_pairs']})")
-        pd.DataFrame([corr]).to_csv(corr_path, index=False)
+        for row in corr_df.itertuples():
+            print(f"  [{row.group}] pearson_r={row.pearson_r:+.4f} p={row.p_value:.4g} (n={row.n_pairs})")
+        corr_df.to_csv(corr_path, index=False)
         print(f"Wrote {corr_path}")
 
     plot_heatmap(sim_matrix, meta, f"Weight-delta cosine similarity -- {state.upper()} {args.variable}",
                  args.fig_dir / f"{state_variable}_weight_similarity_heatmap.png")
-    if corr is not None:
+    if not corr_df.empty:
         plot_transfer_scatter(pairs, f"Weight similarity vs. transfer R^2 -- {state.upper()} {args.variable}",
                                args.fig_dir / f"{state_variable}_weight_vs_transfer_scatter.png")
 
