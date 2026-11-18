@@ -57,32 +57,84 @@ Plus same_season (eval_quarter == model_quarter) and same_year
 (eval_year == model_year) dummies -- never both 1 at once among off-
 diagonal cells by construction (that combination IS the diagonal).
 
-Step 2 -- for each metric M, two OLS fits of cell r2_base, BOTH restricted
+Step 2 -- for each metric M, THREE OLS fits of cell r2_base, ALL restricted
 to the same intersection of cells (only those where M's diff/abs_diff are
 non-NaN, i.e. where --rs-summary-csv covers both the model's and the
-eval's quarter) -- season_year_dummies needs no RS data at all, so
-without this restriction it would silently fit on every off-diagonal
-cell while rs_gap only gets the (often much smaller) RS-covered subset,
-making R^2/AIC incomparable between them (R^2 on a near-saturated n=6
-fit is not meaningfully "better" than R^2 on an n=240 fit):
-    Model A ("rs_gap"):          r2 ~ diff_M + abs_diff_M
-    Model B ("season_year_dummies"): r2 ~ same_season + same_year
-compared on R^2/adjusted R^2/AIC/BIC -- does a continuous measure of how
-different the actual conditions were explain more of the transfer
-accuracy than simply knowing whether it's literally the same calendar
-quarter/year? Plain OLS, not cluster-robust: the "still building"
+eval's quarter) -- the dummy models need no RS data at all, so without
+this restriction they'd silently fit on every off-diagonal cell while
+rs_gap only gets the (often much smaller) RS-covered subset, making
+R^2/AIC incomparable between them (R^2 on a near-saturated n=6 fit is not
+meaningfully "better" than R^2 on an n=240 fit):
+    Model A ("rs_gap"):               r2 ~ diff_M + abs_diff_M
+    Model B ("season_year_dummies"):  r2 ~ same_season + same_year
+    Model C ("season_pair_dummies"):  r2 ~ one dummy per distinct
+        (model_quarter -> eval_quarter) pair actually present (e.g.
+        "Q1->Q3"), reference category dropped
+Model B only knows whether the calendar label matches -- it can't tell
+Q1-model-evaluated-on-Q2 apart from Q2-model-evaluated-on-Q1, even
+though those could be genuinely different transfers (spring->summer
+green-up isn't the mirror of summer->spring senescence). Model C fixes
+that: it's a full categorical interaction that can memorize ANY
+systematic quirk of a *specific* quarter pair, with no assumption the
+relationship is continuous in physical distance at all -- a much harder
+baseline for rs_gap to beat than B, even though adjusted R^2/AIC already
+account for its extra parameters. All three compared on R^2/adjusted
+R^2/AIC/BIC: does a continuous measure of how different the actual
+conditions were explain more of the transfer accuracy than simply
+knowing the calendar identity of the transfer (same/different, OR the
+exact quarter pair)? Plain OLS, not cluster-robust: the "still building"
 dataset this was built for has few off-diagonal cells, and clustered SEs
 need more groups than that to be trustworthy -- read the printed n_obs
 before trusting any p-value here, and treat this as early/exploratory
-per the original request, not a final test.
+per the original request, not a final test. See Step 4 for an
+alternative to trusting these p-values/AIC at face value.
+
+Step 3 -- joint regression (does M survive once other metrics are
+controlled for?): a single OLS fit of r2 on diff_M/abs_diff_M for EVERY
+metric in --joint-metrics at once (default: every metric --rs-summary-csv
+has). This exists because the per-metric fits in Step 2 can't tell "M's
+gap really drives transfer accuracy" apart from "M's gap just correlates
+with some OTHER metric that's the real driver" -- e.g. cloud fraction
+and NDVI both move with season, so NDVI fitting well alone doesn't rule
+out "it's actually a composite-quality (cloudy/hazy chip) effect, and
+NDVI is just riding along." Fitting every metric's diff/abs_diff
+together and checking whether a given metric's coefficient/p-value
+survives is the direct test of that. Restricted to the intersection of
+rows where EVERY included metric has RS coverage (stricter than Step 2's
+per-metric restriction, since now every included metric's diff/abs_diff
+must be non-NaN simultaneously).
+
+Step 4 -- permutation test (are Step 2's p-values/AIC even trustworthy?):
+cells are NOT independent observations -- every (year, quarter) appears
+as the model side of several cells AND the eval side of several others
+(e.g. with 10 distinct quarters, each one touches 9+9=18 of the 90
+possible off-diagonal cells), so a single bad/unusual quarter
+contaminates many rows at once, and OLS's usual p-values/AIC (which
+assume independent errors) are overstated -- there's much less
+independent evidence here than the row count suggests. Rather than lean
+on cluster-robust SEs with too few clusters to trust (see Step 2), this
+permutes at the QUARTER level: shuffle which quarter's metric VALUE is
+attached to which quarter IDENTITY (keeping every cell's actual
+model/eval quarter pairing fixed), rebuild diff_M/abs_diff_M from the
+shuffled assignment, refit the rs_gap model, and record its R^2 --
+repeated --n-perms times to build a null distribution that preserves the
+exact same cluster structure as the real data (every permutation still
+has each quarter's value touching the same 18-ish cells it really does,
+just a different value). The empirical p-value is how often that null
+R^2 matches or beats the real one.
 
 Outputs:
     <out-dir>/<state>_<variable>_cross_quarter_rs_gap.csv   step 1 table
     <out-dir>/<state>_<variable>_rs_gap_regression_coefs.csv   every
-        term's coefficient/SE/t/p, both models, every metric
+        term's coefficient/SE/t/p, every model (rs_gap, season_year_
+        dummies, season_pair_dummies, joint), every metric
     <out-dir>/<state>_<variable>_rs_gap_regression_fit.csv   one row per
         (metric, model): R^2, adj R^2, AIC, BIC, n_obs -- the actual
-        "compare the fit" table
+        "compare the fit" table, joint model included with
+        metric="joint:<m1>+<m2>+..."
+    <out-dir>/<state>_<variable>_rs_gap_permutation.csv   one row per
+        metric: observed rs_gap R^2, null R^2 mean/95th percentile,
+        permutation p-value, n_obs, n_perms
 
 Usage:
     # Cheaper source (no band-importance run needed):
@@ -94,6 +146,13 @@ Usage:
     python 3_analysis/analyze_cross_quarter_rs_gap.py --state oh --variable wealth_index \
         --band-importance-csv 3_analysis/outputs/band_importance/oh_wealth_index_band_importance.csv \
         --rs-summary-csv 3_analysis/outputs/rs_summary/oh_quarterly_rs_summary.csv
+
+    # Joint model restricted to just NDVI + cloud_frac (the specific
+    # composite-quality check), fewer permutations for a quick look:
+    python 3_analysis/analyze_cross_quarter_rs_gap.py --state oh --variable wealth_index \
+        --cross-quarter-r2-csv 3_analysis/out_cross_quarter/oh_wealth_index/r2_matrix.csv \
+        --rs-summary-csv 3_analysis/outputs/rs_summary/oh_quarterly_rs_summary.csv \
+        --joint-metrics ndvi cloud_frac --n-perms 199
 """
 
 import argparse
@@ -214,6 +273,10 @@ def build_rs_gap_table(cells: pd.DataFrame, means: dict, metrics: list) -> pd.Da
     out = cells.copy()
     out["same_season"] = (out.model_quarter == out.eval_quarter).astype(int)
     out["same_year"] = (out.model_year == out.eval_year).astype(int)
+    # Full (model_quarter -> eval_quarter) identity, e.g. "Q1->Q3" -- unlike
+    # same_season (which only knows match/no-match), this lets a dummy
+    # model tell Q1-model-on-Q3-imagery apart from Q3-model-on-Q1-imagery.
+    out["season_pair"] = out.apply(lambda r: f"Q{int(r.model_quarter)}->Q{int(r.eval_quarter)}", axis=1)
 
     for metric in metrics:
         diffs = []
@@ -242,24 +305,111 @@ def fit_ols(y: pd.Series, X: pd.DataFrame):
     return model, len(data)
 
 
+def build_season_pair_dummies(df: pd.DataFrame) -> pd.DataFrame:
+    """One dummy per distinct season_pair value PRESENT IN df (not every
+    theoretically-possible pair), reference category dropped. Built
+    fresh per metric's own subset (see run_regressions) rather than once
+    for the whole gap_table, since which pairs/how many rows are usable
+    varies by metric -- this is deliberate, not an oversight: a pair with
+    zero usable rows for this metric shouldn't get a dummy column at all."""
+    return pd.get_dummies(df["season_pair"], prefix="pair", drop_first=True).astype(float)
+
+
+def fit_joint(gap_table: pd.DataFrame, metrics: list):
+    """One OLS fit of r2 on diff_M/abs_diff_M for EVERY metric in
+    `metrics` simultaneously -- restricted to rows where ALL of them have
+    RS coverage at once (stricter than the per-metric restriction in
+    run_regressions). Tests whether a metric's association with transfer
+    accuracy survives once other metrics -- in particular composite-
+    quality proxies like cloud_frac/snow_frac that move with the same
+    seasonal axis -- are controlled for in the same model."""
+    cols = []
+    for m in metrics:
+        cols += [f"diff_{m}", f"abs_diff_{m}"]
+    subset = gap_table.dropna(subset=cols + ["r2"])
+    model, n = fit_ols(subset["r2"], subset[cols])
+    return model, n
+
+
+def permutation_test_rs_gap(cells: pd.DataFrame, means: dict, metric: str,
+                             n_perms: int = 999, seed: int = 0):
+    """Permutation p-value for metric's rs_gap R^2 that respects the
+    quarter-level clustering Step 4 (module docstring) describes: shuffles
+    which quarter's metric VALUE is attached to which quarter IDENTITY
+    (every cell keeps its real model/eval quarter pairing), rebuilds
+    diff_M/abs_diff_M from the shuffled assignment, and refits r2 ~ diff_M
+    + abs_diff_M each time. Because a quarter's value (not each cell
+    independently) is what gets shuffled, every permuted dataset keeps
+    exactly the same dependency structure as the real one -- the quarters
+    that share cells in reality still share cells (and now a shuffled
+    value) in every permutation. Returns None if fewer than 6 cells have
+    usable RS coverage for this metric (same floor fit_ols uses)."""
+    quarter_keys = sorted(k for k, v in means.items() if metric in v and pd.notna(v[metric]))
+    real_vals = {k: means[k][metric] for k in quarter_keys}
+
+    def diffs_for(value_map):
+        model_vals = np.array([value_map.get((r.model_year, r.model_quarter), np.nan)
+                                for r in cells.itertuples(index=False)], dtype=float)
+        eval_vals = np.array([value_map.get((r.eval_year, r.eval_quarter), np.nan)
+                               for r in cells.itertuples(index=False)], dtype=float)
+        return eval_vals - model_vals
+
+    observed_diff = diffs_for(real_vals)
+    valid = ~np.isnan(observed_diff)
+    if valid.sum() < 6:
+        return None
+
+    y = cells["r2"].to_numpy()[valid]
+
+    def r2_for(diff_vals):
+        X = sm.add_constant(np.column_stack([diff_vals, np.abs(diff_vals)]))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return sm.OLS(y, X).fit().rsquared
+
+    observed_r2 = r2_for(observed_diff[valid])
+
+    rng = np.random.default_rng(seed)
+    values = np.array([real_vals[k] for k in quarter_keys])
+    null_r2 = np.empty(n_perms)
+    for i in range(n_perms):
+        shuffled = dict(zip(quarter_keys, rng.permutation(values)))
+        perm_diff = diffs_for(shuffled)[valid]
+        null_r2[i] = r2_for(perm_diff)
+
+    p_value = (1 + int(np.sum(null_r2 >= observed_r2))) / (n_perms + 1)
+    return {
+        "metric": metric, "observed_r2": observed_r2, "null_r2_mean": float(null_r2.mean()),
+        "null_r2_95pct": float(np.quantile(null_r2, 0.95)), "p_value": p_value,
+        "n_obs": int(valid.sum()), "n_quarters_permuted": len(quarter_keys), "n_perms": n_perms,
+    }
+
+
 def run_regressions(gap_table: pd.DataFrame, metrics: list):
     coef_rows, fit_rows = [], []
 
     for metric in metrics:
         diff_col, abs_col = f"diff_{metric}", f"abs_diff_{metric}"
-        # Both models fit on the SAME rows -- the intersection where this
-        # metric actually has RS coverage -- so n matches and R^2/AIC are
-        # comparable between them. Without this, season_year_dummies
-        # (which needs no RS data) would use every off-diagonal cell
-        # while rs_gap only gets this metric's smaller RS-covered subset.
+        # All three models fit on the SAME rows -- the intersection where
+        # this metric actually has RS coverage -- so n matches and
+        # R^2/AIC are comparable across them. Without this, the dummy
+        # models (which need no RS data) would use every off-diagonal
+        # cell while rs_gap only gets this metric's smaller RS-covered
+        # subset.
         subset = gap_table.dropna(subset=[diff_col, abs_col, "r2"])
+        pair_dummies = build_season_pair_dummies(subset)
+
         model_a, n_a = fit_ols(subset["r2"], subset[[diff_col, abs_col]])
         model_b, n_b = fit_ols(subset["r2"], subset[["same_season", "same_year"]])
+        model_c, n_c = fit_ols(subset["r2"], pair_dummies)
 
-        for label, model, n in [("rs_gap", model_a, n_a), ("season_year_dummies", model_b, n_b)]:
+        fitted = {}
+        for label, model, n in [("rs_gap", model_a, n_a), ("season_year_dummies", model_b, n_b),
+                                 ("season_pair_dummies", model_c, n_c)]:
             if model is None:
                 print(f"[{metric}] {label}: only {n} usable row(s) after dropping NaNs -- skipping")
                 continue
+            fitted[label] = model
             for term in model.params.index:
                 coef_rows.append({
                     "metric": metric, "model": label, "term": term,
@@ -274,9 +424,9 @@ def run_regressions(gap_table: pd.DataFrame, metrics: list):
             print(f"[{metric}] {label}: R^2={model.rsquared:.4f} adj_R^2={model.rsquared_adj:.4f} "
                   f"AIC={model.aic:.2f} (n={int(model.nobs)})")
 
-        if model_a is not None and model_b is not None:
-            better = "rs_gap" if model_a.rsquared_adj > model_b.rsquared_adj else "season_year_dummies"
-            print(f"  -> {better} fits better by adjusted R^2 for {metric}\n")
+        if fitted:
+            best = max(fitted, key=lambda l: fitted[l].rsquared_adj)
+            print(f"  -> {best} fits best by adjusted R^2 for {metric}\n")
 
     return pd.DataFrame(coef_rows), pd.DataFrame(fit_rows)
 
@@ -295,6 +445,13 @@ def main():
                          "you have both; cells present in both are deduplicated, preferring "
                          "--band-importance-csv's value (they should agree).")
     p.add_argument("--rs-summary-csv", required=True, type=Path)
+    p.add_argument("--joint-metrics", nargs="+", default=None,
+                    help="Metrics to include together in the joint 'does M survive once other "
+                         "metrics are controlled for' regression (Step 3). Default: every metric "
+                         "found in --rs-summary-csv.")
+    p.add_argument("--n-perms", type=int, default=999,
+                    help="Permutations for the quarter-level permutation test (Step 4)")
+    p.add_argument("--seed", type=int, default=0, help="Permutation RNG seed")
     p.add_argument("--out-dir", default="3_analysis/outputs/cross_quarter_rs_gap", type=Path)
     args = p.parse_args()
 
@@ -324,12 +481,65 @@ def main():
         raise SystemExit("No metric had enough usable cells to fit either model -- "
                           "wait for --rs-summary-csv to cover more quarters.")
 
+    # Step 3: joint model -- does each metric survive once every OTHER
+    # metric (cloud_frac, snow_frac, etc.) is controlled for at once?
+    joint_metrics = args.joint_metrics if args.joint_metrics else metrics
+    unknown = set(joint_metrics) - set(metrics)
+    if unknown:
+        raise SystemExit(f"--joint-metrics {sorted(unknown)} not found in --rs-summary-csv "
+                          f"(available: {metrics})")
+    joint_label = "joint:" + "+".join(joint_metrics)
+    joint_model, joint_n = fit_joint(gap_table, joint_metrics)
+    if joint_model is None:
+        print(f"\n[{joint_label}] only {joint_n} usable row(s) after dropping NaNs -- skipping "
+              f"(need RS coverage for ALL of {joint_metrics} at once)")
+    else:
+        print(f"\n[{joint_label}] R^2={joint_model.rsquared:.4f} adj_R^2={joint_model.rsquared_adj:.4f} "
+              f"(n={int(joint_model.nobs)})")
+        for term in joint_model.params.index:
+            coef_rows_joint = {
+                "metric": joint_label, "model": "joint", "term": term,
+                "coef": joint_model.params[term], "std_err": joint_model.bse[term],
+                "t": joint_model.tvalues[term], "p_value": joint_model.pvalues[term],
+                "n_obs": int(joint_model.nobs),
+            }
+            coef_df = pd.concat([coef_df, pd.DataFrame([coef_rows_joint])], ignore_index=True)
+            survives = "survives" if joint_model.pvalues[term] < 0.05 else "does NOT survive"
+            if term.startswith("diff_") or term.startswith("abs_diff_"):
+                print(f"    {term}: coef={joint_model.params[term]:+.4f} "
+                      f"p={joint_model.pvalues[term]:.3g} -- {survives} controlling for the others")
+        fit_df = pd.concat([fit_df, pd.DataFrame([{
+            "metric": joint_label, "model": "joint", "r_squared": joint_model.rsquared,
+            "adj_r_squared": joint_model.rsquared_adj, "aic": joint_model.aic, "bic": joint_model.bic,
+            "n_obs": int(joint_model.nobs),
+        }])], ignore_index=True)
+
+    # Step 4: permutation test -- are the per-metric rs_gap p-values/AIC
+    # above even trustworthy, given cells aren't independent (every
+    # quarter touches many cells)?
+    print(f"\nPermutation test ({args.n_perms} perms, quarter-level shuffle):")
+    perm_rows = []
+    for metric in metrics:
+        result = permutation_test_rs_gap(cells, means, metric, n_perms=args.n_perms, seed=args.seed)
+        if result is None:
+            print(f"  [{metric}] too few usable cells for a permutation test -- skipping")
+            continue
+        perm_rows.append(result)
+        print(f"  [{metric}] observed R^2={result['observed_r2']:.4f} vs. null mean="
+              f"{result['null_r2_mean']:.4f} (95th pct={result['null_r2_95pct']:.4f}) "
+              f"-> p={result['p_value']:.4f} (n={result['n_obs']}, "
+              f"{result['n_quarters_permuted']} quarters permuted)")
+    perm_df = pd.DataFrame(perm_rows)
+
     coef_path = args.out_dir / f"{state_variable}_rs_gap_regression_coefs.csv"
     fit_path = args.out_dir / f"{state_variable}_rs_gap_regression_fit.csv"
+    perm_path = args.out_dir / f"{state_variable}_rs_gap_permutation.csv"
     coef_df.to_csv(coef_path, index=False)
     fit_df.to_csv(fit_path, index=False)
+    perm_df.to_csv(perm_path, index=False)
     print(f"\nWrote {coef_path} ({len(coef_df)} rows)")
     print(f"Wrote {fit_path} ({len(fit_df)} rows)")
+    print(f"Wrote {perm_path} ({len(perm_df)} rows)")
 
 
 if __name__ == "__main__":
