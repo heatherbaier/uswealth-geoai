@@ -57,7 +57,14 @@ Plus same_season (eval_quarter == model_quarter) and same_year
 (eval_year == model_year) dummies -- never both 1 at once among off-
 diagonal cells by construction (that combination IS the diagonal).
 
-Step 2 -- for each metric M, two OLS fits of cell r2_base:
+Step 2 -- for each metric M, two OLS fits of cell r2_base, BOTH restricted
+to the same intersection of cells (only those where M's diff/abs_diff are
+non-NaN, i.e. where --rs-summary-csv covers both the model's and the
+eval's quarter) -- season_year_dummies needs no RS data at all, so
+without this restriction it would silently fit on every off-diagonal
+cell while rs_gap only gets the (often much smaller) RS-covered subset,
+making R^2/AIC incomparable between them (R^2 on a near-saturated n=6
+fit is not meaningfully "better" than R^2 on an n=240 fit):
     Model A ("rs_gap"):          r2 ~ diff_M + abs_diff_M
     Model B ("season_year_dummies"): r2 ~ same_season + same_year
 compared on R^2/adjusted R^2/AIC/BIC -- does a continuous measure of how
@@ -240,8 +247,14 @@ def run_regressions(gap_table: pd.DataFrame, metrics: list):
 
     for metric in metrics:
         diff_col, abs_col = f"diff_{metric}", f"abs_diff_{metric}"
-        model_a, n_a = fit_ols(gap_table["r2"], gap_table[[diff_col, abs_col]])
-        model_b, n_b = fit_ols(gap_table["r2"], gap_table[["same_season", "same_year"]])
+        # Both models fit on the SAME rows -- the intersection where this
+        # metric actually has RS coverage -- so n matches and R^2/AIC are
+        # comparable between them. Without this, season_year_dummies
+        # (which needs no RS data) would use every off-diagonal cell
+        # while rs_gap only gets this metric's smaller RS-covered subset.
+        subset = gap_table.dropna(subset=[diff_col, abs_col, "r2"])
+        model_a, n_a = fit_ols(subset["r2"], subset[[diff_col, abs_col]])
+        model_b, n_b = fit_ols(subset["r2"], subset[["same_season", "same_year"]])
 
         for label, model, n in [("rs_gap", model_a, n_a), ("season_year_dummies", model_b, n_b)]:
             if model is None:
