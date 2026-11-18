@@ -67,14 +67,19 @@ BAND_NAMES = ["B01", "B02", "B03", "B04", "B05", "B06", "B07",
 B02_IDX, B03_IDX, B04_IDX, B11_IDX = (BAND_NAMES.index(b) for b in ("B02", "B03", "B04", "B11"))
 
 
-def chip_quality(path: Path, snow_ndsi_threshold: float, cloud_reflectance_threshold: float):
-    with rasterio.open(path) as src:
-        data = src.read()  # (12, H, W), uint16, nodata=0
-
+def quality_from_array(data: np.ndarray, snow_ndsi_threshold: float, cloud_reflectance_threshold: float,
+                        valid: "np.ndarray | None" = None):
+    """Same computation as chip_quality(), factored out to take an
+    already-read (12, H, W) band array (+ optionally an already-computed
+    valid mask) instead of a path -- so a caller that also wants other
+    per-chip stats (e.g. compute_quarterly_rs_summary.py's NDVI/NDWI/
+    NDMI) can read each chip ONCE and reuse the same array/mask, instead
+    of every stat re-opening the same file."""
     if data.shape[0] != len(BAND_NAMES):
-        raise ValueError(f"{path}: expected {len(BAND_NAMES)} bands, got {data.shape[0]}")
+        raise ValueError(f"expected {len(BAND_NAMES)} bands, got {data.shape[0]}")
 
-    valid = np.all(data != 0, axis=0)  # (H, W) -- nonzero in EVERY band
+    if valid is None:
+        valid = np.all(data != 0, axis=0)  # (H, W) -- nonzero in EVERY band
     n_total = valid.size
     n_valid = int(valid.sum())
     valid_obs_frac = n_valid / n_total if n_total else float("nan")
@@ -103,6 +108,12 @@ def chip_quality(path: Path, snow_ndsi_threshold: float, cloud_reflectance_thres
     cloud_frac = float(np.mean(is_cloud))
 
     return {"valid_obs_frac": valid_obs_frac, "snow_frac": snow_frac, "cloud_frac": cloud_frac}
+
+
+def chip_quality(path: Path, snow_ndsi_threshold: float, cloud_reflectance_threshold: float):
+    with rasterio.open(path) as src:
+        data = src.read()  # (12, H, W), uint16, nodata=0
+    return quality_from_array(data, snow_ndsi_threshold, cloud_reflectance_threshold)
 
 
 def process_quarter(state: str, year: int, quarter: int, snow_ndsi_threshold: float,
