@@ -4,7 +4,8 @@ quarter and the quarter it's evaluated on explain cross-quarter transfer
 accuracy better than just "is it the same season" / "is it the same
 year"?
 
-Two inputs, joined on (year, quarter):
+Three inputs, joined on (year, quarter) -- pass at least one of the
+first two (both if you have both):
   --band-importance-csv   band_importance.py's long output. Off-diagonal
                            rows only (eval_year != model_year OR
                            eval_quarter != model_quarter) -- those are
@@ -13,7 +14,22 @@ Two inputs, joined on (year, quarter):
                            transfer at all. r2_base is the same value on
                            every row of a given cell (it's the baseline,
                            computed once before any permutation) --
-                           deduplicated down to one row per cell.
+                           deduplicated down to one row per cell. This is
+                           a real but EXPENSIVE way to get cell R^2: it
+                           comes along for free, but only after also
+                           running 5 permutation repeats x 5 band-groups
+                           per cell that this script doesn't need at all.
+  --cross-quarter-r2-csv   build_cross_quarter_r2_matrix.py's r2_matrix.csv
+                           -- the cheaper, purpose-built alternative: no
+                           permutation work, just the baseline forward
+                           pass. A wide matrix ("Q<quarter> <year>" row/
+                           column labels), melted into the same per-cell
+                           shape as --band-importance-csv. Prefer this
+                           one when its coverage is further along.
+                           Passing both sources at once takes the union
+                           of their cells (deduplicated, preferring
+                           --band-importance-csv's value on overlap --
+                           they should agree anyway).
   --rs-summary-csv        compute_quarterly_rs_summary.py's wide per-
                            tract output. Averaged across every tract
                            into ONE state-level number per (year,
@@ -62,7 +78,13 @@ Outputs:
         "compare the fit" table
 
 Usage:
-    python 3_analysis/analyze_cross_quarter_rs_gap.py \
+    # Cheaper source (no band-importance run needed):
+    python 3_analysis/analyze_cross_quarter_rs_gap.py --state oh --variable wealth_index \
+        --cross-quarter-r2-csv 3_analysis/out_cross_quarter/oh_wealth_index/r2_matrix.csv \
+        --rs-summary-csv 3_analysis/outputs/rs_summary/oh_quarterly_rs_summary.csv
+
+    # From band_importance.py's output instead (or in addition):
+    python 3_analysis/analyze_cross_quarter_rs_gap.py --state oh --variable wealth_index \
         --band-importance-csv 3_analysis/outputs/band_importance/oh_wealth_index_band_importance.csv \
         --rs-summary-csv 3_analysis/outputs/rs_summary/oh_quarterly_rs_summary.csv
 """
@@ -99,7 +121,14 @@ def discover_quarter_means(rs_df: pd.DataFrame):
     return means, sorted(metrics)
 
 
-def load_offdiag_cells(band_csv: Path) -> pd.DataFrame:
+def load_offdiag_cells_from_band_importance(band_csv: Path) -> pd.DataFrame:
+    """r2_base per off-diagonal cell, from band_importance.py's long
+    output -- correct, but EXPENSIVE as a source: r2_base there is a
+    side effect of a baseline forward pass that then also runs 5
+    permutation repeats x 5 band-groups on top, none of which this
+    needs. Prefer --cross-quarter-r2-csv (build_cross_quarter_r2_
+    matrix.py's cheaper, purpose-built matrix) when that coverage is
+    further along; this is here for whichever one you actually have."""
     df = pd.read_csv(band_csv)
     required = {"model_year", "model_quarter", "eval_year", "eval_quarter", "r2_base"}
     missing = required - set(df.columns)
@@ -116,6 +145,62 @@ def load_offdiag_cells(band_csv: Path) -> pd.DataFrame:
     )[["model_year", "model_quarter", "eval_year", "eval_quarter", "r2_base"]].copy()
     cells = cells.rename(columns={"r2_base": "r2"})
     return cells.reset_index(drop=True)
+
+
+CROSS_QUARTER_LABEL_RE = re.compile(r"^Q(\d)\s+(\d{4})$")
+
+
+def load_offdiag_cells_from_cross_quarter_matrix(matrix_csv: Path) -> pd.DataFrame:
+    """r2_matrix.csv from build_cross_quarter_r2_matrix.py: a wide
+    matrix, row/column labels "Q<quarter> <year>" (that script's own
+    `labels = [f"Q{q} {y}" for y, q in quarters]`), cell = R^2. Melted
+    into the same (model_year, model_quarter, eval_year, eval_quarter,
+    r2) shape load_offdiag_cells_from_band_importance returns, skipping
+    the diagonal and any cell that's still blank (not validated yet --
+    this script is meant to work with a matrix that's still filling in)."""
+    df = pd.read_csv(matrix_csv, index_col=0)
+    rows = []
+    for row_label in df.index:
+        m_row = CROSS_QUARTER_LABEL_RE.match(str(row_label).strip())
+        if not m_row:
+            continue
+        model_quarter, model_year = int(m_row.group(1)), int(m_row.group(2))
+        for col_label in df.columns:
+            m_col = CROSS_QUARTER_LABEL_RE.match(str(col_label).strip())
+            if not m_col:
+                continue
+            eval_quarter, eval_year = int(m_col.group(1)), int(m_col.group(2))
+            if (model_year, model_quarter) == (eval_year, eval_quarter):
+                continue  # diagonal
+            val = df.loc[row_label, col_label]
+            if pd.isna(val):
+                continue  # this cell hasn't been validated yet
+            rows.append({"model_year": model_year, "model_quarter": model_quarter,
+                         "eval_year": eval_year, "eval_quarter": eval_quarter, "r2": float(val)})
+    if not rows:
+        raise SystemExit(f"{matrix_csv} has no filled-in off-diagonal cells yet.")
+    return pd.DataFrame(rows)
+
+
+def load_offdiag_cells(band_csv: "Path | None", matrix_csv: "Path | None") -> pd.DataFrame:
+    parts = []
+    if band_csv is not None:
+        cells = load_offdiag_cells_from_band_importance(band_csv)
+        print(f"Loaded {len(cells)} off-diagonal cell(s) from {band_csv}")
+        parts.append(cells)
+    if matrix_csv is not None:
+        cells = load_offdiag_cells_from_cross_quarter_matrix(matrix_csv)
+        print(f"Loaded {len(cells)} off-diagonal cell(s) from {matrix_csv}")
+        parts.append(cells)
+
+    combined = pd.concat(parts, ignore_index=True)
+    key = ["model_year", "model_quarter", "eval_year", "eval_quarter"]
+    n_before = len(combined)
+    combined = combined.drop_duplicates(subset=key, keep="first")
+    if len(parts) > 1 and n_before != len(combined):
+        print(f"  ({n_before - len(combined)} cell(s) present in both sources -- kept the "
+              f"--band-importance-csv value for those, they should agree anyway)")
+    return combined.reset_index(drop=True)
 
 
 def build_rs_gap_table(cells: pd.DataFrame, means: dict, metrics: list) -> pd.DataFrame:
@@ -185,15 +270,28 @@ def run_regressions(gap_table: pd.DataFrame, metrics: list):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--band-importance-csv", required=True, type=Path)
+    p.add_argument("--state", required=True, help="Used only for output file naming")
+    p.add_argument("--variable", required=True, help="Used only for output file naming")
+    p.add_argument("--band-importance-csv", type=Path, default=None,
+                    help="band_importance.py's long output. Has r2_base for off-diagonal cells "
+                         "as a side effect of its (expensive) permutation analysis -- prefer "
+                         "--cross-quarter-r2-csv when that coverage is further along.")
+    p.add_argument("--cross-quarter-r2-csv", type=Path, default=None,
+                    help="build_cross_quarter_r2_matrix.py's r2_matrix.csv -- cheaper, purpose-"
+                         "built source for cell R^2 (no permutation work needed). Pass both if "
+                         "you have both; cells present in both are deduplicated, preferring "
+                         "--band-importance-csv's value (they should agree).")
     p.add_argument("--rs-summary-csv", required=True, type=Path)
     p.add_argument("--out-dir", default="3_analysis/outputs/cross_quarter_rs_gap", type=Path)
     args = p.parse_args()
 
+    if args.band_importance_csv is None and args.cross_quarter_r2_csv is None:
+        raise SystemExit("Pass --band-importance-csv and/or --cross-quarter-r2-csv (at least one)")
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    cells = load_offdiag_cells(args.band_importance_csv)
-    print(f"Loaded {len(cells)} off-diagonal (model, eval) cell(s) from {args.band_importance_csv}")
+    cells = load_offdiag_cells(args.band_importance_csv, args.cross_quarter_r2_csv)
+    print(f"Total: {len(cells)} off-diagonal (model, eval) cell(s)")
 
     rs_df = pd.read_csv(args.rs_summary_csv)
     means, metrics = discover_quarter_means(rs_df)
@@ -203,7 +301,7 @@ def main():
     usable_per_metric = {m: gap_table[f"diff_{m}"].notna().sum() for m in metrics}
     print(f"Usable cells per metric (both quarters covered by --rs-summary-csv): {usable_per_metric}")
 
-    state_variable = Path(args.band_importance_csv).stem.replace("_band_importance", "")
+    state_variable = f"{args.state.lower()}_{args.variable}"
     gap_path = args.out_dir / f"{state_variable}_cross_quarter_rs_gap.csv"
     gap_table.to_csv(gap_path, index=False)
     print(f"Wrote {gap_path} ({len(gap_table)} rows)\n")
