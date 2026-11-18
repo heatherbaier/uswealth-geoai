@@ -248,12 +248,28 @@ def main():
     else:
         shp_path = args.tract_shp
 
-    print(f"[{state.upper()}] wealth covariates from {args.wealth_csv}")
-    covariates = load_wealth_covariates(args.wealth_csv)
-    print(f"  {len(covariates):,} tracts")
-
     print(f"[{state.upper()}] tract area from {shp_path}")
     area = load_tract_area(shp_path)
+    state_geoids = set(area["GEOID"])
+    print(f"  {len(state_geoids):,} tracts in this state's shapefile")
+
+    print(f"[{state.upper()}] wealth covariates from {args.wealth_csv}")
+    covariates = load_wealth_covariates(args.wealth_csv)
+    n_national = len(covariates)
+    # --wealth-csv (and, below, --acs-demographics-csv) are often NATIONAL
+    # files (e.g. wealth_indices_2019_USA.csv, 73,056 tracts) -- restrict
+    # to just this state's own GEOIDs (from the shapefile, the one input
+    # here that's inherently state-scoped) rather than silently writing
+    # every other state's tracts into "<state>_tract_covariates.csv" too
+    # with mostly-NaN area/land-cover/quality columns.
+    covariates = covariates[covariates["GEOID"].isin(state_geoids)].copy()
+    print(f"  {n_national:,} tracts in {args.wealth_csv.name} -> {len(covariates):,} after "
+          f"restricting to {state.upper()}'s own GEOIDs")
+    missing_from_wealth = state_geoids - set(covariates["GEOID"])
+    if missing_from_wealth:
+        print(f"  WARNING: {len(missing_from_wealth)} of this state's shapefile GEOIDs have no "
+              f"row in --wealth-csv at all (sample: {sorted(missing_from_wealth)[:5]})")
+
     covariates = covariates.merge(area, on="GEOID", how="left")
 
     if args.acs_demographics_csv is not None:
