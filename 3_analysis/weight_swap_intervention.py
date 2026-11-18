@@ -54,7 +54,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
 
@@ -112,6 +111,86 @@ def evaluate(model_wrapper, images, coords, labels, device, batch_size):
     return r2, mae, r, preds
 
 
+def run_pair(state, variable, recipient_year, recipient_quarter, donor_year, donor_quarter,
+             eval_year, eval_quarter, swap_groups, ckpt_dir_fn, prefix_fn, data_root_fn,
+             band_mean, band_std, in_channels, device, batch_size, img_size):
+    """Runs the full baseline/intervention/donor-context comparison for
+    ONE (recipient, donor) pair -- the shared logic behind main()'s
+    single-pair CLI and weight_swap_intervention_batch.py's loop over
+    several pairs, so both stay in sync with exactly one implementation.
+    Returns a list of 3 row dicts (condition, r2, mae, r, n_test, plus
+    this pair's full identity), or None if the recipient/eval cell has
+    zero overlapping test tracts (printed, not raised, so a batch run
+    can skip one bad pair without aborting the rest)."""
+    recipient_ckpt_dir = ckpt_dir_fn(recipient_year, recipient_quarter)
+    donor_ckpt_dir = ckpt_dir_fn(donor_year, donor_quarter)
+    print(f"Recipient: {state} Q{recipient_quarter} {recipient_year} -> {recipient_ckpt_dir}")
+    print(f"Donor:     {state} Q{donor_quarter} {donor_year} -> {donor_ckpt_dir}")
+    print(f"Eval imagery: {state} Q{eval_quarter} {eval_year}")
+    print(f"Swapping group(s) from donor into recipient: {swap_groups}")
+
+    print("\nLoading recipient's eval cell (recipient's own held-out test tracts, eval imagery)...")
+    images, coords, labels, _ = load_eval_cell(
+        state, variable, recipient_ckpt_dir, recipient_year, recipient_quarter,
+        eval_year, eval_quarter, data_root_fn, prefix_fn, band_mean, band_std, img_size, batch_size,
+    )
+    n_test = images.shape[0]
+    if n_test == 0:
+        print("  0 overlapping test tracts for this (recipient, eval) cell -- skipping this pair")
+        return None
+    print(f"n_test={n_test}")
+
+    print("\n[1/2] BASELINE -- recipient model, unmodified:")
+    baseline_wrapper, baseline_epoch, _ = load_model_wrapper(recipient_ckpt_dir, in_channels, device)
+    baseline_r2, baseline_mae, baseline_r, _ = evaluate(baseline_wrapper, images, coords, labels,
+                                                         device, batch_size)
+    print(f"  epoch {baseline_epoch}: R^2={baseline_r2:.4f} MAE={baseline_mae:.4f} r={baseline_r:.4f}")
+
+    print(f"\n[2/2] INTERVENTION -- recipient with {'+'.join(swap_groups)} from donor:")
+    intervention_wrapper, intervention_epoch, _ = load_model_wrapper(recipient_ckpt_dir, in_channels, device)
+    donor_state, donor_epoch, donor_path = load_donor_state_dict(donor_ckpt_dir)
+    swap_keys = swap_keys_for_groups(donor_state, swap_groups)
+    n_swapped_params = sum(donor_state[k].numel() for k in swap_keys)
+    print(f"  donor epoch {donor_epoch} ({donor_path}): transplanting {len(swap_keys)} tensor(s), "
+          f"{n_swapped_params:,} params")
+    intervention_wrapper.net = apply_swap(intervention_wrapper.net, donor_state, swap_keys, device)
+    intervention_r2, intervention_mae, intervention_r, _ = evaluate(intervention_wrapper, images, coords,
+                                                                     labels, device, batch_size)
+    print(f"  epoch {intervention_epoch} (patched): R^2={intervention_r2:.4f} MAE={intervention_mae:.4f} "
+          f"r={intervention_r:.4f}")
+    print(f"\nDelta R^2 (intervention - baseline): {intervention_r2 - baseline_r2:+.4f}")
+
+    rows = [
+        {"condition": "baseline", "r2": baseline_r2, "mae": baseline_mae, "r": baseline_r, "n_test": n_test},
+        {"condition": "intervention", "r2": intervention_r2, "mae": intervention_mae, "r": intervention_r,
+         "n_test": n_test},
+    ]
+
+    print("\nFor context (NOT apples-to-apples -- uses the DONOR's own held-out split): "
+          "donor model's own performance on its own quarter's imagery...")
+    donor_images, donor_coords, donor_labels, _ = load_eval_cell(
+        state, variable, donor_ckpt_dir, donor_year, donor_quarter,
+        donor_year, donor_quarter, data_root_fn, prefix_fn, band_mean, band_std, img_size, batch_size,
+    )
+    donor_wrapper, donor_model_epoch, _ = load_model_wrapper(donor_ckpt_dir, in_channels, device)
+    donor_r2, donor_mae, donor_r, _ = evaluate(donor_wrapper, donor_images, donor_coords, donor_labels,
+                                                device, batch_size)
+    print(f"  epoch {donor_model_epoch}: R^2={donor_r2:.4f} MAE={donor_mae:.4f} r={donor_r:.4f} "
+          f"(n_test={donor_images.shape[0]}, donor's own held-out split)")
+    rows.append({"condition": "donor_own_diagonal_context", "r2": donor_r2, "mae": donor_mae, "r": donor_r,
+                 "n_test": donor_images.shape[0]})
+
+    for row in rows:
+        row.update({
+            "state": state, "variable": variable,
+            "recipient_year": recipient_year, "recipient_quarter": recipient_quarter,
+            "donor_year": donor_year, "donor_quarter": donor_quarter,
+            "eval_year": eval_year, "eval_quarter": eval_quarter,
+            "swap_groups": "+".join(swap_groups),
+        })
+    return rows
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--state", required=True)
@@ -151,72 +230,14 @@ def main():
     ckpt_dir_fn, prefix_fn = resolve_ckpt_and_prefix(state, args.variable, args, registry)
     data_root_fn = resolve_data_root_fn(args, registry)
 
-    recipient_ckpt_dir = ckpt_dir_fn(args.recipient_year, args.recipient_quarter)
-    donor_ckpt_dir = ckpt_dir_fn(args.donor_year, args.donor_quarter)
-    print(f"Recipient: {state} Q{args.recipient_quarter} {args.recipient_year} -> {recipient_ckpt_dir}")
-    print(f"Donor:     {state} Q{args.donor_quarter} {args.donor_year} -> {donor_ckpt_dir}")
-    print(f"Eval imagery: {state} Q{args.eval_quarter} {args.eval_year}")
-    print(f"Swapping group(s) from donor into recipient: {args.swap_groups}")
-
-    print("\nLoading recipient's eval cell (recipient's own held-out test tracts, eval imagery)...")
-    images, coords, labels, _ = load_eval_cell(
-        state, args.variable, recipient_ckpt_dir, args.recipient_year, args.recipient_quarter,
-        args.eval_year, args.eval_quarter, data_root_fn, prefix_fn, band_mean, band_std,
-        args.img_size, args.batch_size,
-    )
-    n_test = images.shape[0]
-    if n_test == 0:
+    rows = run_pair(state, args.variable, args.recipient_year, args.recipient_quarter,
+                     args.donor_year, args.donor_quarter, args.eval_year, args.eval_quarter,
+                     args.swap_groups, ckpt_dir_fn, prefix_fn, data_root_fn, band_mean, band_std,
+                     in_channels, args.device, args.batch_size, args.img_size)
+    if rows is None:
         raise SystemExit("0 overlapping test tracts for this (recipient, eval) cell -- nothing to evaluate.")
-    print(f"n_test={n_test}")
-
-    print("\n[1/2] BASELINE -- recipient model, unmodified:")
-    baseline_wrapper, baseline_epoch, _ = load_model_wrapper(recipient_ckpt_dir, in_channels, args.device)
-    baseline_r2, baseline_mae, baseline_r, _ = evaluate(baseline_wrapper, images, coords, labels,
-                                                         args.device, args.batch_size)
-    print(f"  epoch {baseline_epoch}: R^2={baseline_r2:.4f} MAE={baseline_mae:.4f} r={baseline_r:.4f}")
-
-    print(f"\n[2/2] INTERVENTION -- recipient with {'+'.join(args.swap_groups)} from donor:")
-    intervention_wrapper, intervention_epoch, _ = load_model_wrapper(recipient_ckpt_dir, in_channels, args.device)
-    donor_state, donor_epoch, donor_path = load_donor_state_dict(donor_ckpt_dir)
-    swap_keys = swap_keys_for_groups(donor_state, args.swap_groups)
-    n_swapped_params = sum(donor_state[k].numel() for k in swap_keys)
-    print(f"  donor epoch {donor_epoch} ({donor_path}): transplanting {len(swap_keys)} tensor(s), "
-          f"{n_swapped_params:,} params")
-    intervention_wrapper.net = apply_swap(intervention_wrapper.net, donor_state, swap_keys, args.device)
-    intervention_r2, intervention_mae, intervention_r, _ = evaluate(intervention_wrapper, images, coords,
-                                                                     labels, args.device, args.batch_size)
-    print(f"  epoch {intervention_epoch} (patched): R^2={intervention_r2:.4f} MAE={intervention_mae:.4f} "
-          f"r={intervention_r:.4f}")
-    print(f"\nDelta R^2 (intervention - baseline): {intervention_r2 - baseline_r2:+.4f}")
-
-    rows = [
-        {"condition": "baseline", "r2": baseline_r2, "mae": baseline_mae, "r": baseline_r, "n_test": n_test},
-        {"condition": "intervention", "r2": intervention_r2, "mae": intervention_mae, "r": intervention_r,
-         "n_test": n_test},
-    ]
-
-    print("\nFor context (NOT apples-to-apples -- uses the DONOR's own held-out split): "
-          "donor model's own performance on its own quarter's imagery...")
-    donor_images, donor_coords, donor_labels, _ = load_eval_cell(
-        state, args.variable, donor_ckpt_dir, args.donor_year, args.donor_quarter,
-        args.donor_year, args.donor_quarter, data_root_fn, prefix_fn, band_mean, band_std,
-        args.img_size, args.batch_size,
-    )
-    donor_wrapper, donor_model_epoch, _ = load_model_wrapper(donor_ckpt_dir, in_channels, args.device)
-    donor_r2, donor_mae, donor_r, _ = evaluate(donor_wrapper, donor_images, donor_coords, donor_labels,
-                                                args.device, args.batch_size)
-    print(f"  epoch {donor_model_epoch}: R^2={donor_r2:.4f} MAE={donor_mae:.4f} r={donor_r:.4f} "
-          f"(n_test={donor_images.shape[0]}, donor's own held-out split)")
-    rows.append({"condition": "donor_own_diagonal_context", "r2": donor_r2, "mae": donor_mae, "r": donor_r,
-                 "n_test": donor_images.shape[0]})
 
     df = pd.DataFrame(rows)
-    df["state"], df["variable"] = state, args.variable
-    df["recipient_year"], df["recipient_quarter"] = args.recipient_year, args.recipient_quarter
-    df["donor_year"], df["donor_quarter"] = args.donor_year, args.donor_quarter
-    df["eval_year"], df["eval_quarter"] = args.eval_year, args.eval_quarter
-    df["swap_groups"] = "+".join(args.swap_groups)
-
     swap_label = "+".join(args.swap_groups)
     out_path = args.out_dir / (f"{state}_{args.variable}_swap_{args.recipient_year}q{args.recipient_quarter}"
                                 f"_from_{args.donor_year}q{args.donor_quarter}_{swap_label}.csv")
