@@ -31,6 +31,13 @@ rows are always written as a complete unit, so "present" means "done").
 A missing checkpoint or missing imagery for any cell is skipped with a
 message, not a crash.
 
+Incremental saving: the output CSV is rewritten after EVERY trained
+model finishes its full eval sweep (i.e. after each (model_year,
+model_quarter) in the outer loop, not just once at the end) -- so you
+can watch 3_analysis/outputs/amplitude/<state>_<variable>_amplitude_
+predictions.csv grow while this is still running, and a killed/crashed
+run only loses the one model it was partway through, not everything.
+
 Usage:
     python 3_analysis/amplitude_predictions.py --state oh --variable wealth_index \
         --years 2017 2018 2019 --use-state-registry
@@ -154,23 +161,21 @@ def main():
         existing_cells = set(existing_df[["model_year", "model_quarter", "eval_year", "eval_quarter"]]
                               .drop_duplicates().itertuples(index=False, name=None))
 
-    all_rows = []
+    combined = existing_df if existing_df is not None else pd.DataFrame()
     for model_year, model_quarter in itertools.product(args.years, args.quarters):
         rows = run_model(state, args.variable, model_year, model_quarter, args,
                           ckpt_dir_fn, prefix_fn, data_root_fn, band_mean, band_std, in_channels,
                           existing_cells, log)
-        if rows:
-            all_rows.extend(rows)
-
-    new_df = pd.DataFrame(all_rows)
-    if existing_df is not None and not existing_df.empty:
-        combined = pd.concat([existing_df, new_df], ignore_index=True) if not new_df.empty else existing_df
-    else:
-        combined = new_df
+        if not rows:
+            continue
+        new_df = pd.DataFrame(rows)
+        combined = pd.concat([combined, new_df], ignore_index=True) if not combined.empty else new_df
+        combined.to_csv(csv_path, index=False)
+        log(f"  [{state} Q{model_quarter} {model_year}] saved progress: {len(combined):,} rows so far "
+            f"in {csv_path}")
 
     if combined.empty:
         raise SystemExit("No predictions produced -- nothing to write.")
-    combined.to_csv(csv_path, index=False)
     log(f"\nWrote {csv_path} ({len(combined):,} rows, "
         f"{combined[['model_year', 'model_quarter', 'eval_year', 'eval_quarter']].drop_duplicates().shape[0]} cells, "
         f"{combined['GEOID'].nunique():,} unique GEOIDs)")
