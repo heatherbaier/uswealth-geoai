@@ -46,6 +46,15 @@ its eval quarter have RS summary coverage; everything else is skipped
 with a per-metric NaN rather than dropped outright, so one metric's
 missing quarter doesn't block every other metric's regression.
 
+--years (default 2017 2018 2019) restricts EVERY state to this same
+year range before any fitting -- both the off-diagonal cells (a cell is
+dropped if either its model_year or eval_year falls outside --years)
+and the RS summary means (a (year, quarter) outside --years is removed
+from `means` entirely, so it can never be chosen as a same-season-
+control candidate or counted in a quarter-level permutation). Applied
+uniformly so results are comparable state to state regardless of which
+years each state happens to have the most trained models for.
+
 Step 1 -- rs_gap table (one row per off-diagonal cell, one column pair
 per metric): for every metric M in --rs-summary-csv (auto-discovered
 from its q<quarter>_<year>_<metric> columns, not hardcoded, so this
@@ -104,6 +113,21 @@ rows where EVERY included metric has RS coverage (stricter than Step 2's
 per-metric restriction, since now every included metric's diff/abs_diff
 must be non-NaN simultaneously).
 
+IGNORE THE JOINT MODEL'S PER-TERM RESULTS -- kept in the code (and still
+printed/written) as a diagnostic, not deleted, but its coefficients are
+NOT reliable evidence about any individual metric. Confirmed failure
+mode, not a hypothetical one: Arizona's joint fit has EVERY term
+"survive" (p<0.05) with offsetting (opposite-sign, largely canceling)
+coefficients -- the textbook symptom of collinearity among the
+simultaneous predictors, not N independent metrics each truly mattering.
+When predictors move together as tightly as these RS metrics do, OLS
+can and will assign them large, unstable, sign-flipping coefficients
+that fit jointly without any one of them being individually meaningful.
+Use Step 5 (the fixed-order sequential fit) instead for a trustworthy
+per-variable test -- entering terms one block at a time sidesteps this
+failure mode entirely, since blocks are never simultaneously competing
+for the same variance.
+
 Step 4 -- permutation test (are Step 2's p-values/AIC even trustworthy?):
 cells are NOT independent observations -- every (year, quarter) appears
 as the model side of several cells AND the eval side of several others
@@ -123,6 +147,37 @@ has each quarter's value touching the same 18-ish cells it really does,
 just a different value). The empirical p-value is how often that null
 R^2 matches or beats the real one.
 
+Step 5 -- fixed-order sequential fit (the trustworthy alternative to
+Step 3's joint model): three nested OLS fits of cell r2, entered in a
+FIXED order, each adding one block on top of the last --
+    Block 1 ("quality"):            r2 ~ diff/abs_diff of
+        --quality-metrics (default: cloud_frac, valid_obs_frac)
+    Block 2 ("+season_pair"):       Block 1 + season_pair_dummies
+    Block 3 ("+<landscape metric>"): Block 2 + diff/abs_diff of
+        --landscape-metric (default: ndvi) -- ONE variable, entered LAST
+All three fit on the SAME subset of rows (every quality metric's diff/
+abs_diff, season_pair, and the landscape metric's diff/abs_diff all
+non-NaN at once), so each block's R^2 is directly comparable to the
+last. Reports each block's own R^2 and the R^2 ADDED by that block over
+the previous one -- composite-quality confounds and calendar identity
+are given first claim on the variance, so whatever the landscape
+variable adds in Block 3 is variance NEITHER of those could already
+explain, not a number competing simultaneously with them the way a
+joint model's coefficients do.
+
+Step 6 -- permutation test for Step 5's Block-3 increment: permutes the
+landscape metric's values across YEARS *WITHIN EACH SEASON* (quarter) --
+not across quarters the way Step 4 does -- since season_pair_dummies is
+already a fixed, earlier block here; the question specific to Block 3
+is "does the landscape metric's year-to-year variation WITHIN a given
+season carry real signal, or would any random year's value at that
+season do just as well?" Block 2 (quality + season_pair) is fit once;
+each permutation reshuffles which year's value lands at which (year,
+quarter) within its own quarter, rebuilds the landscape metric's diff/
+abs_diff from that shuffled assignment, refits Block 3 on top of the
+SAME unchanged Block 2, and records the R^2 added. The empirical
+p-value is how often that null R^2-added matches or beats the real one.
+
 Outputs:
     <out-dir>/<state>_<variable>_cross_quarter_rs_gap.csv   step 1 table
     <out-dir>/<state>_<variable>_rs_gap_regression_coefs.csv   every
@@ -135,9 +190,16 @@ Outputs:
     <out-dir>/<state>_<variable>_rs_gap_permutation.csv   one row per
         metric: observed rs_gap R^2, null R^2 mean/95th percentile,
         permutation p-value, n_obs, n_perms
+    <out-dir>/<state>_<variable>_rs_gap_sequential_fit.csv   one row per
+        block (quality, +season_pair, +<landscape metric>): R^2,
+        R^2 added over the previous block, n_obs
+    <out-dir>/<state>_<variable>_rs_gap_sequential_permutation.csv   one
+        row: Block 3's observed R^2-added, null mean/95th percentile,
+        permutation p-value, n_obs, n_perms (years-within-season shuffle)
 
 Usage:
-    # Cheaper source (no band-importance run needed):
+    # Cheaper source (no band-importance run needed), restricted by
+    # default to --years 2017 2018 2019:
     python 3_analysis/analyze_cross_quarter_rs_gap.py --state oh --variable wealth_index \
         --cross-quarter-r2-csv 3_analysis/out_cross_quarter/oh_wealth_index/r2_matrix.csv \
         --rs-summary-csv 3_analysis/outputs/rs_summary/oh_quarterly_rs_summary.csv
@@ -148,11 +210,13 @@ Usage:
         --rs-summary-csv 3_analysis/outputs/rs_summary/oh_quarterly_rs_summary.csv
 
     # Joint model restricted to just NDVI + cloud_frac (the specific
-    # composite-quality check), fewer permutations for a quick look:
+    # composite-quality check -- still diagnostic-only, see Step 3),
+    # fewer permutations for a quick look, landscape metric = ndwi for
+    # the Step 5/6 sequential fit instead of the default ndvi:
     python 3_analysis/analyze_cross_quarter_rs_gap.py --state oh --variable wealth_index \
         --cross-quarter-r2-csv 3_analysis/out_cross_quarter/oh_wealth_index/r2_matrix.csv \
         --rs-summary-csv 3_analysis/outputs/rs_summary/oh_quarterly_rs_summary.csv \
-        --joint-metrics ndvi cloud_frac --n-perms 199
+        --joint-metrics ndvi cloud_frac --landscape-metric ndwi --n-perms 199
 """
 
 import argparse
@@ -385,6 +449,146 @@ def permutation_test_rs_gap(cells: pd.DataFrame, means: dict, metric: str,
     }
 
 
+def fit_sequential(gap_table: pd.DataFrame, quality_metrics: list, landscape_metric: str):
+    """Three nested OLS fits of cell r2, in a FIXED order (see Step 5,
+    module docstring): quality metrics' diff/abs_diff first, then
+    season_pair_dummies, then the one landscape metric last. All three
+    fit on the SAME subset of rows (every quality metric's diff/
+    abs_diff, season_pair, and the landscape metric's diff/abs_diff all
+    non-NaN at once) so each block's R^2 is directly comparable to the
+    one before it. Returns (OrderedDict of {block_name: model_or_None},
+    n_obs) -- a block is None if that subset is too small for fit_ols's
+    own floor, same as every other model in this script."""
+    quality_cols = []
+    for m in quality_metrics:
+        quality_cols += [f"diff_{m}", f"abs_diff_{m}"]
+    landscape_cols = [f"diff_{landscape_metric}", f"abs_diff_{landscape_metric}"]
+
+    needed = quality_cols + landscape_cols + ["r2"]
+    subset = gap_table.dropna(subset=needed)
+    if subset.empty:
+        return {}, 0
+
+    pair_dummies = build_season_pair_dummies(subset)
+    step1_X = subset[quality_cols]
+    step2_X = pd.concat([step1_X, pair_dummies], axis=1)
+    step3_X = pd.concat([step2_X, subset[landscape_cols]], axis=1)
+
+    blocks = {}
+    for block_name, X in [
+        ("quality", step1_X),
+        ("quality+season_pair", step2_X),
+        (f"quality+season_pair+{landscape_metric}", step3_X),
+    ]:
+        model, _ = fit_ols(subset["r2"], X)
+        blocks[block_name] = model
+    return blocks, len(subset)
+
+
+def run_sequential_regression(gap_table: pd.DataFrame, quality_metrics: list, landscape_metric: str):
+    blocks, n = fit_sequential(gap_table, quality_metrics, landscape_metric)
+    if not blocks or any(m is None for m in blocks.values()):
+        print(f"  only {n} usable row(s) after dropping NaNs -- skipping the sequential fit "
+              f"(need RS coverage for {quality_metrics + [landscape_metric]} AND season_pair at once)")
+        return pd.DataFrame()
+
+    rows = []
+    prev_r2 = 0.0
+    for block_name, model in blocks.items():
+        added = model.rsquared - prev_r2
+        rows.append({"block": block_name, "r_squared": model.rsquared, "r_squared_added": added, "n_obs": n})
+        print(f"  [{block_name}] R^2={model.rsquared:.4f} (+{added:.4f}) n={n}")
+        prev_r2 = model.rsquared
+    return pd.DataFrame(rows)
+
+
+def permute_years_within_season(means: dict, metric: str, quarters: list, years: list, rng) -> dict:
+    """Returns {(year, quarter): shuffled_value} for `metric` only --
+    each quarter's set of (year, value) pairs is shuffled INDEPENDENTLY
+    across the years present for that quarter (season/quarter identity
+    never changes; only which year's real value lands where, within its
+    own quarter). See Step 6, module docstring, for why this -- not a
+    quarter-level shuffle -- is the right null for Block 3's increment
+    once season_pair_dummies is already a fixed earlier block."""
+    shuffled = {}
+    for q in quarters:
+        keys = [(y, q) for y in years if (y, q) in means and metric in means[(y, q)]
+                and pd.notna(means[(y, q)][metric])]
+        if not keys:
+            continue
+        values = np.array([means[k][metric] for k in keys])
+        permuted_values = rng.permutation(values)
+        for k, v in zip(keys, permuted_values):
+            shuffled[k] = v
+    return shuffled
+
+
+def permutation_test_sequential(gap_table: pd.DataFrame, means: dict, quality_metrics: list,
+                                 landscape_metric: str, quarters: list, years: list,
+                                 n_perms: int = 999, seed: int = 0):
+    """Permutation p-value for Step 5's Block-3 R^2-added, permuting the
+    landscape metric's values across years WITHIN EACH SEASON (see
+    permute_years_within_season). Block 2 (quality + season_pair) is fit
+    ONCE outside the loop -- it never changes across permutations, only
+    Block 3 (which adds the landscape metric on top) does. Returns None
+    if the base subset (quality metrics + season_pair, ignoring the
+    landscape metric) has too few usable rows."""
+    quality_cols = []
+    for m in quality_metrics:
+        quality_cols += [f"diff_{m}", f"abs_diff_{m}"]
+    landscape_diff_col, landscape_abs_col = f"diff_{landscape_metric}", f"abs_diff_{landscape_metric}"
+
+    subset = gap_table.dropna(subset=quality_cols + [landscape_diff_col, landscape_abs_col, "r2"])
+    if len(subset) < len(quality_cols) + 6:
+        return None
+
+    pair_dummies = build_season_pair_dummies(subset)
+    step2_X = pd.concat([subset[quality_cols], pair_dummies], axis=1)
+    model2, _ = fit_ols(subset["r2"], step2_X)
+    if model2 is None:
+        return None
+
+    def diffs_for(value_map):
+        model_vals = np.array([value_map.get((r.model_year, r.model_quarter), np.nan)
+                                for r in subset.itertuples(index=False)], dtype=float)
+        eval_vals = np.array([value_map.get((r.eval_year, r.eval_quarter), np.nan)
+                               for r in subset.itertuples(index=False)], dtype=float)
+        return eval_vals - model_vals
+
+    def r2_added_for(land_diff_values):
+        X3 = step2_X.copy()
+        X3[landscape_diff_col] = land_diff_values
+        X3[landscape_abs_col] = np.abs(land_diff_values)
+        model3, _ = fit_ols(subset["r2"], X3)
+        if model3 is None:
+            return np.nan
+        return model3.rsquared - model2.rsquared
+
+    real_value_map = {k: v[landscape_metric] for k, v in means.items() if landscape_metric in v}
+    observed_diff = diffs_for(real_value_map)
+    if np.isnan(observed_diff).any():
+        # subset was already restricted to rows with non-NaN diff_<landscape_metric>, so a
+        # NaN here would mean the stored diff_ column and a fresh recompute disagree --
+        # fail loudly rather than silently feeding a bad fit.
+        raise RuntimeError("diffs_for(real_value_map) produced NaN(s) on rows already filtered "
+                            "to have a usable diff_<landscape_metric> -- data/means mismatch")
+    observed_added = r2_added_for(observed_diff)
+
+    rng = np.random.default_rng(seed)
+    null_added = np.empty(n_perms)
+    for i in range(n_perms):
+        shuffled_map = permute_years_within_season(means, landscape_metric, quarters, years, rng)
+        null_added[i] = r2_added_for(diffs_for(shuffled_map))
+
+    valid_null = null_added[~np.isnan(null_added)]
+    p_value = (1 + int(np.sum(valid_null >= observed_added))) / (len(valid_null) + 1) if len(valid_null) else np.nan
+    return {
+        "observed_r2_added": observed_added, "null_mean": float(np.nanmean(null_added)),
+        "null_95pct": float(np.nanquantile(valid_null, 0.95)) if len(valid_null) else np.nan,
+        "p_value": p_value, "n_obs": len(subset), "n_perms": n_perms,
+    }
+
+
 def run_regressions(gap_table: pd.DataFrame, metrics: list):
     coef_rows, fit_rows = [], []
 
@@ -445,12 +649,22 @@ def main():
                          "you have both; cells present in both are deduplicated, preferring "
                          "--band-importance-csv's value (they should agree).")
     p.add_argument("--rs-summary-csv", required=True, type=Path)
+    p.add_argument("--years", nargs="+", type=int, default=[2017, 2018, 2019],
+                    help="Restrict every state to this year range before any fitting -- both the "
+                         "off-diagonal cells and the RS summary means (default: 2017 2018 2019)")
     p.add_argument("--joint-metrics", nargs="+", default=None,
                     help="Metrics to include together in the joint 'does M survive once other "
-                         "metrics are controlled for' regression (Step 3). Default: every metric "
-                         "found in --rs-summary-csv.")
+                         "metrics are controlled for' regression (Step 3) -- diagnostic only, see "
+                         "that step's docstring. Default: every metric found in --rs-summary-csv.")
+    p.add_argument("--quality-metrics", nargs="+", default=["cloud_frac", "valid_obs_frac"],
+                    help="Composite-quality metrics entered FIRST in the Step 5 sequential fit "
+                         "(default: cloud_frac valid_obs_frac)")
+    p.add_argument("--landscape-metric", default="ndvi",
+                    help="The ONE landscape metric entered LAST in the Step 5 sequential fit "
+                         "(default: ndvi)")
     p.add_argument("--n-perms", type=int, default=999,
-                    help="Permutations for the quarter-level permutation test (Step 4)")
+                    help="Permutations for the quarter-level (Step 4) and years-within-season "
+                         "(Step 6) permutation tests")
     p.add_argument("--seed", type=int, default=0, help="Permutation RNG seed")
     p.add_argument("--out-dir", default="3_analysis/outputs/cross_quarter_rs_gap", type=Path)
     args = p.parse_args()
@@ -461,11 +675,17 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     cells = load_offdiag_cells(args.band_importance_csv, args.cross_quarter_r2_csv)
-    print(f"Total: {len(cells)} off-diagonal (model, eval) cell(s)")
+    n_before_years = len(cells)
+    cells = cells[cells.model_year.isin(args.years) & cells.eval_year.isin(args.years)].reset_index(drop=True)
+    print(f"Total: {len(cells)} off-diagonal (model, eval) cell(s) within --years {args.years} "
+          f"({n_before_years - len(cells)} dropped for falling outside it)")
 
     rs_df = pd.read_csv(args.rs_summary_csv)
     means, metrics = discover_quarter_means(rs_df)
-    print(f"RS summary covers {len(means)} (year, quarter) cell(s), metrics: {metrics}")
+    n_quarters_before_years = len(means)
+    means = {k: v for k, v in means.items() if k[0] in args.years}
+    print(f"RS summary covers {len(means)} (year, quarter) cell(s) within --years {args.years} "
+          f"({n_quarters_before_years - len(means)} dropped), metrics: {metrics}")
 
     gap_table = build_rs_gap_table(cells, means, metrics)
     usable_per_metric = {m: gap_table[f"diff_{m}"].notna().sum() for m in metrics}
@@ -513,6 +733,10 @@ def main():
             "adj_r_squared": joint_model.rsquared_adj, "aic": joint_model.aic, "bic": joint_model.bic,
             "n_obs": int(joint_model.nobs),
         }])], ignore_index=True)
+        print("  NOTE: joint-model coefficients above are DIAGNOSTIC ONLY -- collinearity among "
+              "these RS metrics can (and for some states, does -- see module docstring's Step 3) "
+              "make every term look individually significant with offsetting coefficients. Use "
+              "the Step 5 sequential fit below for a trustworthy per-variable test.")
 
     # Step 4: permutation test -- are the per-metric rs_gap p-values/AIC
     # above even trustworthy, given cells aren't independent (every
@@ -531,15 +755,56 @@ def main():
               f"{result['n_quarters_permuted']} quarters permuted)")
     perm_df = pd.DataFrame(perm_rows)
 
+    # Step 5: fixed-order sequential fit -- quality metrics first, then
+    # season_pair_dummies, then the one landscape metric last. The
+    # trustworthy alternative to Step 3's joint model (see that step's
+    # docstring for why its per-term results are diagnostic-only).
+    unknown_quality = set(args.quality_metrics) - set(metrics)
+    if unknown_quality:
+        raise SystemExit(f"--quality-metrics {sorted(unknown_quality)} not found in --rs-summary-csv "
+                          f"(available: {metrics})")
+    if args.landscape_metric not in metrics:
+        raise SystemExit(f"--landscape-metric {args.landscape_metric!r} not found in --rs-summary-csv "
+                          f"(available: {metrics})")
+    print(f"\nSequential fit (fixed order: {args.quality_metrics} -> season_pair -> "
+          f"{args.landscape_metric}):")
+    sequential_df = run_sequential_regression(gap_table, args.quality_metrics, args.landscape_metric)
+
+    # Step 6: permutation test for Block 3's R^2-added, years permuted
+    # within each season (not across quarters -- season_pair is already
+    # a fixed earlier block here, see that function's docstring).
+    print(f"\nSequential permutation test ({args.n_perms} perms, years-within-season shuffle):")
+    quarters_present = sorted(cells["model_quarter"].unique().tolist() + cells["eval_quarter"].unique().tolist())
+    quarters_present = sorted(set(quarters_present))
+    seq_perm_result = permutation_test_sequential(
+        gap_table, means, args.quality_metrics, args.landscape_metric, quarters_present, args.years,
+        n_perms=args.n_perms, seed=args.seed,
+    )
+    if seq_perm_result is None:
+        print("  too few usable cells for the sequential permutation test -- skipping")
+        seq_perm_df = pd.DataFrame()
+    else:
+        print(f"  Block 3 ({args.landscape_metric}) R^2 added: observed="
+              f"{seq_perm_result['observed_r2_added']:.4f} vs. null mean="
+              f"{seq_perm_result['null_mean']:.4f} (95th pct={seq_perm_result['null_95pct']:.4f}) "
+              f"-> p={seq_perm_result['p_value']:.4f} (n={seq_perm_result['n_obs']})")
+        seq_perm_df = pd.DataFrame([{"landscape_metric": args.landscape_metric, **seq_perm_result}])
+
     coef_path = args.out_dir / f"{state_variable}_rs_gap_regression_coefs.csv"
     fit_path = args.out_dir / f"{state_variable}_rs_gap_regression_fit.csv"
     perm_path = args.out_dir / f"{state_variable}_rs_gap_permutation.csv"
+    sequential_path = args.out_dir / f"{state_variable}_rs_gap_sequential_fit.csv"
+    sequential_perm_path = args.out_dir / f"{state_variable}_rs_gap_sequential_permutation.csv"
     coef_df.to_csv(coef_path, index=False)
     fit_df.to_csv(fit_path, index=False)
     perm_df.to_csv(perm_path, index=False)
+    sequential_df.to_csv(sequential_path, index=False)
+    seq_perm_df.to_csv(sequential_perm_path, index=False)
     print(f"\nWrote {coef_path} ({len(coef_df)} rows)")
     print(f"Wrote {fit_path} ({len(fit_df)} rows)")
     print(f"Wrote {perm_path} ({len(perm_df)} rows)")
+    print(f"Wrote {sequential_path} ({len(sequential_df)} rows)")
+    print(f"Wrote {sequential_perm_path} ({len(seq_perm_df)} rows)")
 
 
 if __name__ == "__main__":
