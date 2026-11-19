@@ -6,7 +6,7 @@ and summarizes how much of each pair's transfer gap the swap recovers
 2018 model on Q3 2018 imagery) showed a large recovery: does that
 generalize, or was it a feature of that one pair?
 
-Pairs come from one of two sources:
+Pairs come from one of three sources:
   --top-n-worst (default)   auto-discovers the N worst off-diagonal
       cells from --band-importance-csv/--cross-quarter-r2-csv (same
       loader analyze_cross_quarter_rs_gap.py uses), sorted by R^2
@@ -17,9 +17,20 @@ Pairs come from one of two sources:
       -- the same natural pairing the original single-pair request
       used, since donor_year/donor_quarter default to eval_year/
       eval_quarter in weight_swap_intervention.py too).
+  --all-cells                every off-diagonal cell in the source CSV,
+      not just the worst N -- the same (recipient, donor) pairing as
+      above, just unfiltered. Expensive: a full 16x16 grid has 240
+      off-diagonal cells, each needing 2+ model loads and forward
+      passes (baseline, intervention, donor context), on top of
+      whatever --swap-groups requires.
   --pairs                   explicit override: one or more
       "recipient_year:recipient_quarter:donor_year:donor_quarter"
       strings, for full manual control instead of auto-discovery.
+
+Incremental saving + resume (specifically for --all-cells, where a run
+can be long): both output files are rewritten after EVERY pair
+finishes, and a pair already present in an existing summary CSV is
+skipped on a rerun unless --overwrite is given.
 
 Recovery fraction per pair: (intervention_r2 - baseline_r2) /
 (donor_r2 - baseline_r2) -- 0 means the swap did nothing, 1 means it
@@ -52,6 +63,11 @@ Usage:
     # Explicit pairs instead of auto-discovery:
     python 3_analysis/weight_swap_intervention_batch.py --state oh --variable wealth_index \
         --pairs 2018:1:2018:3 2017:2:2017:4 2016:4:2016:2
+
+    # Every off-diagonal cell (expensive -- see above):
+    python 3_analysis/weight_swap_intervention_batch.py --state oh --variable wealth_index \
+        --cross-quarter-r2-csv ./out_cross_quarter/oh_wealth_index/r2_matrix.csv \
+        --all-cells
 """
 
 import argparse
@@ -96,6 +112,14 @@ def discover_worst_pairs(band_importance_csv, cross_quarter_r2_csv, top_n: int) 
     return pairs
 
 
+def discover_all_pairs(band_importance_csv, cross_quarter_r2_csv) -> list:
+    cells = load_offdiag_cells(band_importance_csv, cross_quarter_r2_csv)
+    print(f"All {len(cells)} off-diagonal cell(s) (--all-cells, unsorted/unfiltered):")
+    pairs = [(row.model_year, row.model_quarter, row.eval_year, row.eval_quarter)
+              for row in cells.itertuples(index=False)]
+    return pairs
+
+
 def recovery_fraction(baseline_r2, intervention_r2, donor_r2):
     denom = donor_r2 - baseline_r2
     if denom <= 0:
@@ -114,6 +138,9 @@ def main():
     p.add_argument("--cross-quarter-r2-csv", type=Path, default=None,
                     help="Cheaper alternative to --band-importance-csv for the same purpose")
     p.add_argument("--top-n-worst", type=int, default=3)
+    p.add_argument("--all-cells", action="store_true",
+                    help="Run EVERY off-diagonal cell instead of just --top-n-worst -- expensive, "
+                         "see module docstring. Ignores --top-n-worst.")
     p.add_argument("--swap-groups", nargs="+", default=["patch_embed", "stage1"])
     p.add_argument("--version", default=None)
     p.add_argument("--use-state-registry", action="store_true")
@@ -123,6 +150,8 @@ def main():
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--img-size", type=int, nargs=2, default=[256, 256])
     p.add_argument("--out-dir", default="3_analysis/outputs/weight_drift", type=Path)
+    p.add_argument("--overwrite", action="store_true",
+                    help="Recompute every pair instead of resuming from an existing summary CSV")
     args = p.parse_args()
 
     state = args.state.lower()
@@ -130,6 +159,10 @@ def main():
 
     if args.pairs is not None:
         pairs = parse_pairs(args.pairs)
+    elif args.all_cells:
+        if args.band_importance_csv is None and args.cross_quarter_r2_csv is None:
+            raise SystemExit("--all-cells needs --band-importance-csv/--cross-quarter-r2-csv")
+        pairs = discover_all_pairs(args.band_importance_csv, args.cross_quarter_r2_csv)
     else:
         if args.band_importance_csv is None and args.cross_quarter_r2_csv is None:
             raise SystemExit("Pass --pairs explicitly, or --band-importance-csv/--cross-quarter-r2-csv "
@@ -144,9 +177,25 @@ def main():
     ckpt_dir_fn, prefix_fn = resolve_ckpt_and_prefix(state, args.variable, args, registry)
     data_root_fn = resolve_data_root_fn(args, registry)
 
-    all_rows = []
-    summary_rows = []
+    state_variable = f"{state}_{args.variable}"
+    long_path = args.out_dir / f"{state_variable}_swap_batch_long.csv"
+    summary_path = args.out_dir / f"{state_variable}_swap_batch_summary.csv"
+
+    existing_summary = pd.read_csv(summary_path) if (summary_path.exists() and not args.overwrite) else None
+    existing_long = pd.read_csv(long_path) if (long_path.exists() and not args.overwrite) else None
+    done_pairs = set()
+    if existing_summary is not None and not existing_summary.empty:
+        done_pairs = set(existing_summary[["recipient_year", "recipient_quarter", "donor_year", "donor_quarter"]]
+                          .itertuples(index=False, name=None))
+        print(f"Resuming from {summary_path} ({len(done_pairs)} pair(s) already done)")
+
+    all_rows = list(existing_long.to_dict("records")) if existing_long is not None else []
+    summary_rows = list(existing_summary.to_dict("records")) if existing_summary is not None else []
+
     for i, (ry, rq, dy, dq) in enumerate(pairs):
+        if (ry, rq, dy, dq) in done_pairs:
+            print(f"\nPair {i + 1}/{len(pairs)}: recipient {ry}Q{rq} <- donor {dy}Q{dq} -- already done, skipping")
+            continue
         print(f"\n{'=' * 70}\nPair {i + 1}/{len(pairs)}: recipient {ry}Q{rq} <- donor {dy}Q{dq}\n{'=' * 70}")
         rows = run_pair(state, args.variable, ry, rq, dy, dq, dy, dq, args.swap_groups,
                          ckpt_dir_fn, prefix_fn, data_root_fn, band_mean, band_std, in_channels,
@@ -169,17 +218,15 @@ def main():
         frac_str = f"{frac:.1%}" if pd.notna(frac) else "n/a (donor_r2 <= baseline_r2)"
         print(f"  recovery_fraction={frac_str}")
 
+        pd.DataFrame(all_rows).to_csv(long_path, index=False)
+        pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+        print(f"  saved progress: {len(summary_rows)} pair(s) so far in {summary_path}")
+
     if not summary_rows:
         raise SystemExit("Every pair was skipped -- nothing to summarize.")
 
-    state_variable = f"{state}_{args.variable}"
-    long_path = args.out_dir / f"{state_variable}_swap_batch_long.csv"
-    pd.DataFrame(all_rows).to_csv(long_path, index=False)
-    print(f"\nWrote {long_path} ({len(all_rows)} rows)")
-
     summary_df = pd.DataFrame(summary_rows)
-    summary_path = args.out_dir / f"{state_variable}_swap_batch_summary.csv"
-    summary_df.to_csv(summary_path, index=False)
+    print(f"\nWrote {long_path} ({len(all_rows)} rows)")
     print(f"Wrote {summary_path} ({len(summary_df)} pairs)")
 
     valid = summary_df["recovery_fraction"].dropna()
