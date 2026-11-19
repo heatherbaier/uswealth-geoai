@@ -18,7 +18,9 @@ configs/sail/
 configs/**/*.sh
 *slurm*
 slurm_files
-
+3_analysis/
+out_cross_quarter/
+4_analysis/outputs/
 
 wc_tiles/
 !modeling_results/**/*.csv

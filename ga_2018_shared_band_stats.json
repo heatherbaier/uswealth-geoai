@@ -1,0 +1,41 @@
+{
+  "band_mean": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "band_std": [
+    0.0001,
+    0.0001,
+    0.0001,
+    0.0001,
+    0.0001,
+    0.0001,
+    0.0001,
+    0.0001,
+    0.0001,
+    0.0001,
+    0.0001,
+    0.0001
+  ],
+  "n_sampled_total": 800,
+  "n_bands": 12,
+  "sample_size_per_quarter": 200,
+  "seed": 1337,
+  "scale_divisor": 10000.0,
+  "source_prefixes": [
+    "ga_2018_q1_s2_allbands",
+    "ga_2018_q2_s2_allbands",
+    "ga_2018_q3_s2_allbands",
+    "ga_2018_q4_s2_allbands"
+  ]
+}
