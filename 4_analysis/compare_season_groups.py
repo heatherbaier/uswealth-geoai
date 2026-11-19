@@ -14,6 +14,12 @@ under that shuffled labeling, and recompute the R^2/Pearson r gap --
 repeated --n-perms times to see how often a gap this big happens by
 chance.
 
+Reads build_cross_quarter_r2_matrix.py's own output layout directly --
+<matrix-root>/<state>_<variable>/r2_matrix.csv and pearson_r_matrix.csv
+(its default --out-dir, which is what run_cross_quarter_full.sh already
+produces -- no extra step needed beyond that script now also writing
+pearson_r_matrix.csv).
+
 Usage:
     python 4_analysis/compare_season_groups.py --states oh pa az ga
 """
@@ -117,7 +123,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--states", nargs="+", required=True)
     p.add_argument("--variable", default="wealth_index")
-    p.add_argument("--matrix-dir", default="3_analysis/outputs/calibration_vs_ranking", type=Path)
+    p.add_argument("--matrix-dir", default="out_cross_quarter", type=Path,
+                    help="Root containing <state>_<variable>/r2_matrix.csv + pearson_r_matrix.csv "
+                         "(build_cross_quarter_r2_matrix.py's default --out-dir root)")
     p.add_argument("--out-dir", default="4_analysis/outputs", type=Path)
     p.add_argument("--n-perms", type=int, default=999)
     p.add_argument("--seed", type=int, default=0)
@@ -126,8 +134,9 @@ def main():
 
     all_means, all_rq1 = [], []
     for state in [s.lower() for s in args.states]:
-        r2_path = args.matrix_dir / f"{state}_{args.variable}_r2_matrix.csv"
-        pearson_path = args.matrix_dir / f"{state}_{args.variable}_pearson_r_matrix.csv"
+        state_dir = args.matrix_dir / f"{state}_{args.variable}"
+        r2_path = state_dir / "r2_matrix.csv"
+        pearson_path = state_dir / "pearson_r_matrix.csv"
         if not r2_path.exists() or not pearson_path.exists():
             print(f"[{state}] missing {r2_path} or {pearson_path}, skipping")
             continue
