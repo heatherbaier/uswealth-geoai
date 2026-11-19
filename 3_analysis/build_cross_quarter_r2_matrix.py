@@ -9,6 +9,10 @@ what 3_validation/validate.py's per-state summary already reports one
 quarter at a time -- this is the same numbers, arranged as a full matrix
 instead of a single quarter-by-quarter line.
 
+Writes r2_matrix.csv, pearson_r_matrix.csv, and n_matrix.csv to --out-dir
+(same "Q<quarter> <year>" row/column labels on all three) -- the first
+two are what 4_analysis/compare_season_groups.py reads.
+
 Doesn't run anything itself -- reads the epoch*_valset_<prefix>_preds.csv
 files sail's task: validate already wrote (see sail PR #23; each
 (model quarter, imagery quarter) pair gets its own uniquely-named CSV,
@@ -53,6 +57,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.colors import TwoSlopeNorm
+from scipy.stats import pearsonr
 from sklearn.metrics import r2_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline_configs"))
@@ -135,6 +140,7 @@ def build_matrix(state, variable, quarters, version, registry,
     labels = [f"Q{q} {y}" for y, q in quarters]
     n = len(quarters)
     r2 = pd.DataFrame(np.nan, index=labels, columns=labels)
+    pearson_r = pd.DataFrame(np.nan, index=labels, columns=labels)
     n_pairs = pd.DataFrame(0, index=labels, columns=labels, dtype=int)
     bootstrap_rows = []
 
@@ -157,6 +163,8 @@ def build_matrix(state, variable, quarters, version, registry,
             y_pred = df["pred"].to_numpy()
             score = r2_score(y_true, y_pred)
             r2.iloc[i, j] = score
+            r_score = np.nan if np.ptp(y_true) == 0 or np.ptp(y_pred) == 0 else pearsonr(y_pred, y_true)[0]
+            pearson_r.iloc[i, j] = r_score
             n_pairs.iloc[i, j] = len(df)
             marker = " (diagonal)" if i == j else ""
 
@@ -174,10 +182,11 @@ def build_matrix(state, variable, quarters, version, registry,
                     boot_msg = (f"  {int(ci * 100)}% CI=[{boot['ci_lower']:.4f}, "
                                 f"{boot['ci_upper']:.4f}] (n_boot={boot['n_boot']})")
 
-            print(f"[{labels[i]} model on {labels[j]} imagery]{marker} r2={score:.4f} n={len(df)}{boot_msg}")
+            print(f"[{labels[i]} model on {labels[j]} imagery]{marker} r2={score:.4f} "
+                  f"r={r_score:.4f} n={len(df)}{boot_msg}")
 
     bootstrap_df = pd.DataFrame(bootstrap_rows)
-    return r2, n_pairs, bootstrap_df
+    return r2, pearson_r, n_pairs, bootstrap_df
 
 
 def plot_matrix(r2: pd.DataFrame, state: str, variable: str, out_path: str):
@@ -249,7 +258,7 @@ def main():
     quarters = [parse_imagery_quarter(t) for t in args.quarters]
     registry = load_registry()
 
-    r2, n_pairs, bootstrap_df = build_matrix(
+    r2, pearson_r, n_pairs, bootstrap_df = build_matrix(
         args.state, args.variable, quarters, args.version, registry,
         bootstrap_iters=args.bootstrap_iters, ci=args.ci, seed=args.seed,
     )
@@ -257,8 +266,10 @@ def main():
     out_dir = Path(args.out_dir or f"./out_cross_quarter/{args.state.lower()}_{args.variable}")
     out_dir.mkdir(parents=True, exist_ok=True)
     r2.to_csv(out_dir / "r2_matrix.csv")
+    pearson_r.to_csv(out_dir / "pearson_r_matrix.csv")
     n_pairs.to_csv(out_dir / "n_matrix.csv")
-    print(f"Wrote {out_dir / 'r2_matrix.csv'} and {out_dir / 'n_matrix.csv'}")
+    print(f"Wrote {out_dir / 'r2_matrix.csv'}, {out_dir / 'pearson_r_matrix.csv'}, "
+          f"and {out_dir / 'n_matrix.csv'}")
 
     if args.bootstrap_iters > 0:
         boot_path = out_dir / "r2_bootstrap.csv"
