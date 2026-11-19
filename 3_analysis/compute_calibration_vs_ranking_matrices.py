@@ -68,6 +68,13 @@ printed note) if the eval quarter's training tracts have fewer than 5
 usable tracts, or if the model's predictions on them have zero variance
 (a degenerate linear fit) -- never silently reported as a real number.
 
+Incremental saving: all 5 output files (the long CSV + 4 matrix CSV/PNG
+pairs) are rewritten after EVERY trained model finishes its full eval
+sweep, not just once at the very end -- so you can watch a state's
+matrices fill in while a long run is still going. A model whose full
+row of eval cells is already present in an existing long CSV is skipped
+on a rerun (resume); pass --overwrite to recompute everything instead.
+
 Output, per state in --states:
     <out-dir>/<state>_<variable>_calibration_vs_ranking_long.csv   one
         row per cell: model/eval year+quarter, r2, pearson_r,
@@ -279,6 +286,29 @@ def plot_matrix(matrix: pd.DataFrame, title: str, out_path: Path, vrange: "tuple
     print(f"Wrote {out_path}")
 
 
+MATRIX_SPECS = [
+    ("r2", "r2", "R^2 (raw)", None),
+    ("pearson_r", "pearson_r", "Pearson r", (-1.0, 1.0)),
+    ("r2_recalibrated", "r2_recalibrated", "R^2 (recalibrated on target quarter's training tracts)", None),
+    ("bias", "bias", "Mean signed prediction bias (pred - label, raw)", None),
+]
+
+
+def write_outputs(df: pd.DataFrame, long_path: Path, state_variable: str, state: str, variable: str,
+                   quarters_grid: list, out_dir: Path, fig_dir: Path):
+    """Rewrites the long CSV and every matrix CSV/PNG from the CURRENT
+    accumulated df -- called after every model finishes (see run_for_
+    state) so progress is visible/resumable while a long run is still
+    going, not just once at the very end."""
+    df.to_csv(long_path, index=False)
+    for value_col, matrix_name, title, vrange in MATRIX_SPECS:
+        matrix = build_matrix(df, value_col, quarters_grid)
+        matrix_path = out_dir / f"{state_variable}_{matrix_name}_matrix.csv"
+        matrix.to_csv(matrix_path)
+        plot_matrix(matrix, f"{title} -- {state.upper()} {variable}",
+                    fig_dir / f"{state_variable}_{matrix_name}_matrix.png", vrange)
+
+
 def run_for_state(state, args, registry):
     def log(msg):
         print(msg, flush=True)
@@ -288,35 +318,42 @@ def run_for_state(state, args, registry):
     ckpt_dir_fn, prefix_fn = resolve_ckpt_and_prefix(state, args.variable, args, registry)
     data_root_fn = resolve_data_root_fn(args, registry)
 
-    all_rows = []
-    for model_year, model_quarter in itertools.product(args.years, args.quarters):
-        rows = run_model(state, args.variable, model_year, model_quarter, args.years, args.quarters,
-                          args, ckpt_dir_fn, prefix_fn, data_root_fn, band_mean, band_std, in_channels, log)
-        all_rows.extend(rows)
-
-    if not all_rows:
-        log(f"[{state}] No cells produced -- nothing to write for this state.")
-        return
-
-    df = pd.DataFrame(all_rows)
     state_variable = f"{state}_{args.variable}"
     long_path = args.out_dir / f"{state_variable}_calibration_vs_ranking_long.csv"
-    df.to_csv(long_path, index=False)
-    print(f"\nWrote {long_path} ({len(df)} rows)")
-
     quarters_grid = list(itertools.product(args.years, args.quarters))
-    for value_col, matrix_name, title, vrange in [
-        ("r2", "r2", "R^2 (raw)", None),
-        ("pearson_r", "pearson_r", "Pearson r", (-1.0, 1.0)),
-        ("r2_recalibrated", "r2_recalibrated", "R^2 (recalibrated on target quarter's training tracts)", None),
-        ("bias", "bias", "Mean signed prediction bias (pred - label, raw)", None),
-    ]:
-        matrix = build_matrix(df, value_col, quarters_grid)
-        matrix_path = args.out_dir / f"{state_variable}_{matrix_name}_matrix.csv"
-        matrix.to_csv(matrix_path)
-        print(f"Wrote {matrix_path}")
-        plot_matrix(matrix, f"{title} -- {state.upper()} {args.variable}",
-                    args.fig_dir / f"{state_variable}_{matrix_name}_matrix.png", vrange)
+
+    existing_df = pd.read_csv(long_path) if (long_path.exists() and not args.overwrite) else None
+    existing_cells = set()
+    if existing_df is not None and not existing_df.empty:
+        existing_cells = set(existing_df[["model_year", "model_quarter", "eval_year", "eval_quarter"]]
+                              .drop_duplicates().itertuples(index=False, name=None))
+        log(f"[{state}] resuming from {long_path} ({len(existing_df)} row(s) / "
+            f"{len(existing_cells)} cell(s) already done)")
+
+    combined = existing_df if existing_df is not None else pd.DataFrame()
+    for model_year, model_quarter in itertools.product(args.years, args.quarters):
+        model_done = existing_cells and all((model_year, model_quarter, ey, eq) in existing_cells
+                                             for ey, eq in quarters_grid)
+        if model_done:
+            log(f"[{state} Q{model_quarter} {model_year}] already complete in {long_path}, skipping")
+            continue
+
+        rows = run_model(state, args.variable, model_year, model_quarter, args.years, args.quarters,
+                          args, ckpt_dir_fn, prefix_fn, data_root_fn, band_mean, band_std, in_channels, log)
+        if not rows:
+            continue
+
+        new_df = pd.DataFrame(rows)
+        combined = pd.concat([combined, new_df], ignore_index=True) if not combined.empty else new_df
+        write_outputs(combined, long_path, state_variable, state, args.variable, quarters_grid,
+                      args.out_dir, args.fig_dir)
+        log(f"  [{state} Q{model_quarter} {model_year}] saved progress: {len(combined):,} rows so far "
+            f"in {long_path}")
+
+    if combined.empty:
+        log(f"[{state}] No cells produced -- nothing to write for this state.")
+        return
+    print(f"\n[{state}] done: {long_path} ({len(combined)} rows)")
 
 
 def main():
@@ -334,6 +371,8 @@ def main():
     p.add_argument("--img-size", type=int, nargs=2, default=[256, 256])
     p.add_argument("--out-dir", default="3_analysis/outputs/calibration_vs_ranking", type=Path)
     p.add_argument("--fig-dir", default="3_analysis/figures/calibration_vs_ranking", type=Path)
+    p.add_argument("--overwrite", action="store_true",
+                    help="Recompute every cell instead of resuming from an existing long CSV")
     args = p.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
