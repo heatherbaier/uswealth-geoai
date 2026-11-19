@@ -1,6 +1,7 @@
 """
 For every (model_year, model_quarter) x (eval_year, eval_quarter) cell
-across --years (default 2017-2019), THREE matrices per state:
+across --years (default 2017-2019), for EVERY state in --states, FOUR
+matrices per state:
 
   1. R^2               Raw predictions vs. true labels, on the model's
                         own held-out test tracts, as they appear in the
@@ -26,8 +27,20 @@ across --years (default 2017-2019), THREE matrices per state:
                         this quarter, does a cheap post-hoc linear fix
                         on a handful of in-domain examples recover most
                         of the lost R^2?"
+  4. Bias (mean signed)  mean(pred - label) over the SAME test tracts
+                        R^2/Pearson r use (raw predictions, no
+                        recalibration) -- a cell can have a terrible R^2
+                        purely from DIRECTION (every prediction too high
+                        or too low by about the same amount) rather than
+                        a ranking failure; this number says which way and
+                        by how much, distinct from R^2/r (which are both
+                        blind to the sign/magnitude of a consistent
+                        offset) and from recal_intercept (that's the
+                        offset a linear fit WOULD apply, fit on training
+                        tracts; bias is the offset actually observed on
+                        the test tracts, no fitting involved).
 
-Together, these three give you the calibration-vs-ranking split
+Together, these four give you the calibration-vs-ranking split
 everywhere: high Pearson r + high recalibrated R^2 + low raw R^2 means a
 pure calibration problem (fixable cheaply, no architecture change or
 retraining needed -- the model already "knows" relative wealth, it's
@@ -55,19 +68,29 @@ printed note) if the eval quarter's training tracts have fewer than 5
 usable tracts, or if the model's predictions on them have zero variance
 (a degenerate linear fit) -- never silently reported as a real number.
 
-Output:
+Incremental saving: all 5 output files (the long CSV + 4 matrix CSV/PNG
+pairs) are rewritten after EVERY trained model finishes its full eval
+sweep, not just once at the very end -- so you can watch a state's
+matrices fill in while a long run is still going. A model whose full
+row of eval cells is already present in an existing long CSV is skipped
+on a rerun (resume); pass --overwrite to recompute everything instead.
+
+Output, per state in --states:
     <out-dir>/<state>_<variable>_calibration_vs_ranking_long.csv   one
         row per cell: model/eval year+quarter, r2, pearson_r,
-        r2_recalibrated, recal_slope, recal_intercept, n_test, n_train
+        r2_recalibrated, bias, recal_slope, recal_intercept, n_test,
+        n_train
     <out-dir>/<state>_<variable>_r2_matrix.csv
     <out-dir>/<state>_<variable>_pearson_r_matrix.csv
     <out-dir>/<state>_<variable>_r2_recalibrated_matrix.csv
+    <out-dir>/<state>_<variable>_bias_matrix.csv
     <fig-dir>/<state>_<variable>_r2_matrix.png
     <fig-dir>/<state>_<variable>_pearson_r_matrix.png
     <fig-dir>/<state>_<variable>_r2_recalibrated_matrix.png
+    <fig-dir>/<state>_<variable>_bias_matrix.png
 
 Usage:
-    python 3_analysis/compute_calibration_vs_ranking_matrices.py --state oh --variable wealth_index
+    python 3_analysis/compute_calibration_vs_ranking_matrices.py --states oh pa az ga --variable wealth_index
 """
 
 import argparse
@@ -181,6 +204,7 @@ def run_model(state, variable, model_year, model_quarter, years, quarters, args,
         preds_test = _predict_all(model_wrapper, images_test, coords_test, args.device, args.batch_size).numpy()
         labels_test_np = labels_test.numpy()
         r2_raw, _, r = compute_metrics(preds_test, labels_test_np)
+        bias = float(np.mean(preds_test - labels_test_np))
 
         r2_recal, recal_a, recal_b, n_train = np.nan, np.nan, np.nan, 0
         try:
@@ -205,12 +229,12 @@ def run_model(state, variable, model_year, model_quarter, years, quarters, args,
 
         marker = " (diagonal)" if (model_year, model_quarter) == (eval_year, eval_quarter) else ""
         log(f"  [eval {state} Q{eval_quarter} {eval_year}]{marker} r2={r2_raw:.4f} r={r:.4f} "
-            f"r2_recal={r2_recal:.4f} (n_test={n_test}, n_train={n_train})")
+            f"r2_recal={r2_recal:.4f} bias={bias:+.4f} (n_test={n_test}, n_train={n_train})")
 
         rows.append({
             "model_year": model_year, "model_quarter": model_quarter,
             "eval_year": eval_year, "eval_quarter": eval_quarter,
-            "r2": r2_raw, "pearson_r": r, "r2_recalibrated": r2_recal,
+            "r2": r2_raw, "pearson_r": r, "r2_recalibrated": r2_recal, "bias": bias,
             "recal_slope": recal_a, "recal_intercept": recal_b,
             "n_test": n_test, "n_train": n_train,
         })
@@ -262,9 +286,79 @@ def plot_matrix(matrix: pd.DataFrame, title: str, out_path: Path, vrange: "tuple
     print(f"Wrote {out_path}")
 
 
+MATRIX_SPECS = [
+    ("r2", "r2", "R^2 (raw)", None),
+    ("pearson_r", "pearson_r", "Pearson r", (-1.0, 1.0)),
+    ("r2_recalibrated", "r2_recalibrated", "R^2 (recalibrated on target quarter's training tracts)", None),
+    ("bias", "bias", "Mean signed prediction bias (pred - label, raw)", None),
+]
+
+
+def write_outputs(df: pd.DataFrame, long_path: Path, state_variable: str, state: str, variable: str,
+                   quarters_grid: list, out_dir: Path, fig_dir: Path):
+    """Rewrites the long CSV and every matrix CSV/PNG from the CURRENT
+    accumulated df -- called after every model finishes (see run_for_
+    state) so progress is visible/resumable while a long run is still
+    going, not just once at the very end."""
+    df.to_csv(long_path, index=False)
+    for value_col, matrix_name, title, vrange in MATRIX_SPECS:
+        matrix = build_matrix(df, value_col, quarters_grid)
+        matrix_path = out_dir / f"{state_variable}_{matrix_name}_matrix.csv"
+        matrix.to_csv(matrix_path)
+        plot_matrix(matrix, f"{title} -- {state.upper()} {variable}",
+                    fig_dir / f"{state_variable}_{matrix_name}_matrix.png", vrange)
+
+
+def run_for_state(state, args, registry):
+    def log(msg):
+        print(msg, flush=True)
+
+    st = resolve_state_settings(state, registry if registry is not None else load_registry())
+    band_mean, band_std, in_channels = st["band_mean"], st["band_std"], st["in_channels"]
+    ckpt_dir_fn, prefix_fn = resolve_ckpt_and_prefix(state, args.variable, args, registry)
+    data_root_fn = resolve_data_root_fn(args, registry)
+
+    state_variable = f"{state}_{args.variable}"
+    long_path = args.out_dir / f"{state_variable}_calibration_vs_ranking_long.csv"
+    quarters_grid = list(itertools.product(args.years, args.quarters))
+
+    existing_df = pd.read_csv(long_path) if (long_path.exists() and not args.overwrite) else None
+    existing_cells = set()
+    if existing_df is not None and not existing_df.empty:
+        existing_cells = set(existing_df[["model_year", "model_quarter", "eval_year", "eval_quarter"]]
+                              .drop_duplicates().itertuples(index=False, name=None))
+        log(f"[{state}] resuming from {long_path} ({len(existing_df)} row(s) / "
+            f"{len(existing_cells)} cell(s) already done)")
+
+    combined = existing_df if existing_df is not None else pd.DataFrame()
+    for model_year, model_quarter in itertools.product(args.years, args.quarters):
+        model_done = existing_cells and all((model_year, model_quarter, ey, eq) in existing_cells
+                                             for ey, eq in quarters_grid)
+        if model_done:
+            log(f"[{state} Q{model_quarter} {model_year}] already complete in {long_path}, skipping")
+            continue
+
+        rows = run_model(state, args.variable, model_year, model_quarter, args.years, args.quarters,
+                          args, ckpt_dir_fn, prefix_fn, data_root_fn, band_mean, band_std, in_channels, log)
+        if not rows:
+            continue
+
+        new_df = pd.DataFrame(rows)
+        combined = pd.concat([combined, new_df], ignore_index=True) if not combined.empty else new_df
+        write_outputs(combined, long_path, state_variable, state, args.variable, quarters_grid,
+                      args.out_dir, args.fig_dir)
+        log(f"  [{state} Q{model_quarter} {model_year}] saved progress: {len(combined):,} rows so far "
+            f"in {long_path}")
+
+    if combined.empty:
+        log(f"[{state}] No cells produced -- nothing to write for this state.")
+        return
+    print(f"\n[{state}] done: {long_path} ({len(combined)} rows)")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--state", required=True)
+    p.add_argument("--states", nargs="+", required=True)
     p.add_argument("--variable", default="wealth_index")
     p.add_argument("--years", nargs="+", type=int, default=[2017, 2018, 2019])
     p.add_argument("--quarters", nargs="+", type=int, default=[1, 2, 3, 4], choices=[1, 2, 3, 4])
@@ -277,48 +371,18 @@ def main():
     p.add_argument("--img-size", type=int, nargs=2, default=[256, 256])
     p.add_argument("--out-dir", default="3_analysis/outputs/calibration_vs_ranking", type=Path)
     p.add_argument("--fig-dir", default="3_analysis/figures/calibration_vs_ranking", type=Path)
+    p.add_argument("--overwrite", action="store_true",
+                    help="Recompute every cell instead of resuming from an existing long CSV")
     args = p.parse_args()
 
-    state = args.state.lower()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     args.fig_dir.mkdir(parents=True, exist_ok=True)
 
-    def log(msg):
-        print(msg, flush=True)
-
     registry = load_registry() if args.use_state_registry else None
-    st = resolve_state_settings(state, registry if registry is not None else load_registry())
-    band_mean, band_std, in_channels = st["band_mean"], st["band_std"], st["in_channels"]
-    ckpt_dir_fn, prefix_fn = resolve_ckpt_and_prefix(state, args.variable, args, registry)
-    data_root_fn = resolve_data_root_fn(args, registry)
 
-    all_rows = []
-    for model_year, model_quarter in itertools.product(args.years, args.quarters):
-        rows = run_model(state, args.variable, model_year, model_quarter, args.years, args.quarters,
-                          args, ckpt_dir_fn, prefix_fn, data_root_fn, band_mean, band_std, in_channels, log)
-        all_rows.extend(rows)
-
-    if not all_rows:
-        raise SystemExit("No cells produced -- nothing to write.")
-
-    df = pd.DataFrame(all_rows)
-    state_variable = f"{state}_{args.variable}"
-    long_path = args.out_dir / f"{state_variable}_calibration_vs_ranking_long.csv"
-    df.to_csv(long_path, index=False)
-    print(f"\nWrote {long_path} ({len(df)} rows)")
-
-    quarters_grid = list(itertools.product(args.years, args.quarters))
-    for value_col, matrix_name, title, vrange in [
-        ("r2", "r2", "R^2 (raw)", None),
-        ("pearson_r", "pearson_r", "Pearson r", (-1.0, 1.0)),
-        ("r2_recalibrated", "r2_recalibrated", "R^2 (recalibrated on target quarter's training tracts)", None),
-    ]:
-        matrix = build_matrix(df, value_col, quarters_grid)
-        matrix_path = args.out_dir / f"{state_variable}_{matrix_name}_matrix.csv"
-        matrix.to_csv(matrix_path)
-        print(f"Wrote {matrix_path}")
-        plot_matrix(matrix, f"{title} -- {state.upper()} {args.variable}",
-                    args.fig_dir / f"{state_variable}_{matrix_name}_matrix.png", vrange)
+    for state in [s.lower() for s in args.states]:
+        print(f"\n{'=' * 70}\n{state.upper()}\n{'=' * 70}")
+        run_for_state(state, args, registry)
 
 
 if __name__ == "__main__":
