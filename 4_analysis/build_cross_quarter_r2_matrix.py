@@ -11,7 +11,12 @@ instead of a single quarter-by-quarter line.
 
 Writes r2_matrix.csv, pearson_r_matrix.csv, and n_matrix.csv to --out-dir
 (same "Q<quarter> <year>" row/column labels on all three) -- the first
-two are what 4_analysis/compare_season_groups.py reads.
+two are what 4_analysis/compare_season_groups.py reads. Also writes
+raw_predictions_long.csv: every cell's own per-tract GEOID/pred/label,
+concatenated (the exact rows each cell's R^2/Pearson r above are
+computed from, just not reduced to a single number) -- GEOID comes from
+each preds CSV's 'name' column the same way analyze_transfer_penalty_
+landcover.py already does (chip path stem, normalize_geoid()).
 
 Doesn't run anything itself -- reads the epoch*_valset_<prefix>_preds.csv
 files sail's task: validate already wrote (see sail PR #23; each
@@ -61,9 +66,11 @@ from scipy.stats import pearsonr
 from sklearn.metrics import r2_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline_configs"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "1_data_prep"))
 from generate_train_config import load_registry, resolve_state_settings  # noqa: E402
 from generate_validate_config import latest_existing_version  # noqa: E402
 from generate_cross_validate_config import parse_imagery_quarter, CROSS_QUARTER_SUBDIR  # noqa: E402
+from update_ys_labels import normalize_geoid  # noqa: E402
 
 
 def model_ckpt_dir(state, variable, year, quarter, version, registry):
@@ -143,6 +150,7 @@ def build_matrix(state, variable, quarters, version, registry,
     pearson_r = pd.DataFrame(np.nan, index=labels, columns=labels)
     n_pairs = pd.DataFrame(0, index=labels, columns=labels, dtype=int)
     bootstrap_rows = []
+    raw_parts = []
 
     for i, (model_year, model_quarter) in enumerate(quarters):
         try:
@@ -161,6 +169,13 @@ def build_matrix(state, variable, quarters, version, registry,
             df = pd.read_csv(csv_path)
             y_true = df["label"].to_numpy()
             y_pred = df["pred"].to_numpy()
+            raw_parts.append(pd.DataFrame({
+                "state": state, "variable": variable,
+                "model_year": model_year, "model_quarter": model_quarter,
+                "imagery_year": imagery_year, "imagery_quarter": imagery_quarter,
+                "GEOID": df["name"].apply(lambda p: normalize_geoid(Path(p).stem)),
+                "pred": y_pred, "label": y_true,
+            }))
             score = r2_score(y_true, y_pred)
             r2.iloc[i, j] = score
             r_score = np.nan if np.ptp(y_true) == 0 or np.ptp(y_pred) == 0 else pearsonr(y_pred, y_true)[0]
@@ -186,7 +201,8 @@ def build_matrix(state, variable, quarters, version, registry,
                   f"r={r_score:.4f} n={len(df)}{boot_msg}")
 
     bootstrap_df = pd.DataFrame(bootstrap_rows)
-    return r2, pearson_r, n_pairs, bootstrap_df
+    raw_df = pd.concat(raw_parts, ignore_index=True) if raw_parts else pd.DataFrame()
+    return r2, pearson_r, n_pairs, bootstrap_df, raw_df
 
 
 def plot_matrix(r2: pd.DataFrame, state: str, variable: str, out_path: str):
@@ -258,7 +274,7 @@ def main():
     quarters = [parse_imagery_quarter(t) for t in args.quarters]
     registry = load_registry()
 
-    r2, pearson_r, n_pairs, bootstrap_df = build_matrix(
+    r2, pearson_r, n_pairs, bootstrap_df, raw_df = build_matrix(
         args.state, args.variable, quarters, args.version, registry,
         bootstrap_iters=args.bootstrap_iters, ci=args.ci, seed=args.seed,
     )
@@ -270,6 +286,14 @@ def main():
     n_pairs.to_csv(out_dir / "n_matrix.csv")
     print(f"Wrote {out_dir / 'r2_matrix.csv'}, {out_dir / 'pearson_r_matrix.csv'}, "
           f"and {out_dir / 'n_matrix.csv'}")
+
+    if raw_df.empty:
+        print("No cell had a preds CSV to read -- skipping raw_predictions_long.csv")
+    else:
+        raw_path = out_dir / "raw_predictions_long.csv"
+        raw_df.to_csv(raw_path, index=False)
+        print(f"Wrote {raw_path} ({len(raw_df):,} tract-level row(s) across "
+              f"{raw_df[['model_year', 'model_quarter', 'imagery_year', 'imagery_quarter']].drop_duplicates().shape[0]} cell(s))")
 
     if args.bootstrap_iters > 0:
         boot_path = out_dir / "r2_bootstrap.csv"
