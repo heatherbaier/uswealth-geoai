@@ -251,8 +251,8 @@ def main():
                     help="Default: analyze_transfer_penalty_landcover.DEFAULT_DATA_ROOT_TEMPLATE")
     p.add_argument("--n-perms", type=int, default=999, help="Permutations for the clustering test")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--out-dir", default="3_analysis/outputs/weight_drift", type=Path)
-    p.add_argument("--fig-dir", default="3_analysis/figures/weight_drift", type=Path)
+    p.add_argument("--out-dir", default="4_analysis/outputs/weight_drift/", type=Path)
+    p.add_argument("--fig-dir", default="4_analysis/outputs/weight_drift/figures/", type=Path)
     args = p.parse_args()
     if args.data_root_template is None:
         from analyze_transfer_penalty_landcover import DEFAULT_DATA_ROOT_TEMPLATE
