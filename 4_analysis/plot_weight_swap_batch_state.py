@@ -38,6 +38,13 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import TwoSlopeNorm
 
+# NaN cells (the diagonal, always missing, plus any pair the batch
+# script itself left NaN -- donor_r2 <= baseline_r2) must read as
+# visibly MISSING, not as a true value of ~0 -- RdBu's own center color
+# is white, so without this a blank cell and a real "no effect" cell
+# would otherwise be indistinguishable.
+NAN_COLOR = "#bdbdbd"
+
 
 def quarter_labels(df: pd.DataFrame) -> list:
     pairs = set(zip(df["recipient_year"], df["recipient_quarter"])) | \
@@ -67,7 +74,9 @@ def plot_heatmap(ax, matrix: pd.DataFrame, title: str, vrange: "tuple | None" = 
         vmin, vmax = float(finite.min()), float(finite.max())
     norm = TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax) if vmin < 0 < vmax else None
 
-    im = ax.imshow(matrix.values, cmap="RdBu", norm=norm, vmin=None if norm else vmin, vmax=None if norm else vmax)
+    cmap = plt.get_cmap("RdBu").copy()
+    cmap.set_bad(NAN_COLOR)
+    im = ax.imshow(matrix.values, cmap=cmap, norm=norm, vmin=None if norm else vmin, vmax=None if norm else vmax)
     ax.set_xticks(range(len(matrix.columns)))
     ax.set_xticklabels(matrix.columns, rotation=45, ha="right", fontsize=8)
     ax.set_yticks(range(len(matrix.index)))
@@ -93,7 +102,9 @@ def plot_state(df: pd.DataFrame, state: str, swap_groups: "str | None", out_path
 
     swap_str = f" (swapped: {swap_groups})" if swap_groups else ""
     fig.suptitle(f"{state.upper()}: weight-swap intervention, every off-diagonal pair{swap_str}")
-    fig.tight_layout()
+    fig.text(0.5, 0.01, f"Gray = no data (diagonal) or excluded (donor R^2 <= baseline R^2) -- not a true 0",
+              ha="center", fontsize=8, color="#595959")
+    fig.tight_layout(rect=(0, 0.02, 1, 1))
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"Wrote {out_path}")

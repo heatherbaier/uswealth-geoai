@@ -71,7 +71,9 @@ def plot_all_states(all_data: dict, out_path: Path):
             fig.colorbar(im1, ax=axes[row][1], fraction=0.046)
 
     fig.suptitle("Weight-swap intervention, every off-diagonal pair, across states")
-    fig.tight_layout()
+    fig.text(0.5, 0.005, "Gray = no data (diagonal) or excluded (donor R^2 <= baseline R^2) -- not a true 0",
+              ha="center", fontsize=8, color="#595959")
+    fig.tight_layout(rect=(0, 0.015, 1, 1))
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"Wrote {out_path}")
